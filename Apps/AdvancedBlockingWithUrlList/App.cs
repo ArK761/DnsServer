@@ -634,15 +634,15 @@ namespace AdvancedBlockingWithUrlList
 
         public static int GetPropertyValue(this JsonElement element, string propertyName, int defaultValue)
         {
-            if (element.TryGetProperty(propertyName, out JsonElement value) && value.ValueKind == JsonValueKind.Number)
-                return value.GetInt32();
+            if (element.TryGetProperty(propertyName, out JsonElement value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int intValue))
+                return intValue;
             return defaultValue;
         }
 
         public static uint GetPropertyValue(this JsonElement element, string propertyName, uint defaultValue)
         {
-            if (element.TryGetProperty(propertyName, out JsonElement value) && value.ValueKind == JsonValueKind.Number)
-                return value.GetUInt32();
+            if (element.TryGetProperty(propertyName, out JsonElement value) && value.ValueKind == JsonValueKind.Number && value.TryGetUInt32(out uint uintValue))
+                return uintValue;
             return defaultValue;
         }
     }
