@@ -1,5 +1,5 @@
 /*
- AdvancedBlockingWithUrlList
+ AdvancedBlockingWithUrlList - TestVersion
  Supports:
   - ipListMaps (URL -> name)
   - group name auto-linked to ipListMaps name
