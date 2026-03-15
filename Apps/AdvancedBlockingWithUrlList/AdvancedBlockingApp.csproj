@@ -3,13 +3,13 @@
 	<PropertyGroup>
 		<TargetFramework>net9.0</TargetFramework>
 		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-		<Version>1.0_BETA</Version>
+		<Version>1.0-beta</Version>
 		<IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 		<Company>Technitium</Company>
 		<Product>Technitium DNS Server</Product>
 		<Authors>Shreyas Zare</Authors>
-		<AssemblyName>AdvancedBlockingApp</AssemblyName>
-		<RootNamespace>AdvancedBlocking</RootNamespace>
+		<AssemblyName>AdvancedBlockingWithUrlList</AssemblyName>
+		<RootNamespace>AdvancedBlockingWithUrlList</RootNamespace>
 		<PackageProjectUrl>https://technitium.com/dns/</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/TechnitiumSoftware/DnsServer</RepositoryUrl>
 		<Description>Blocks domain names using block lists and regex block lists. Supports creating groups based on client's IP address or subnet to enforce different block lists and regex block lists for each group.\n\nNote! This app works independent of the DNS server's built-in blocking feature. The options configured in DNS server Settings section does not apply to this app.</Description>
