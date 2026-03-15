@@ -279,6 +279,7 @@ namespace AdvancedBlockingWithUrlList
                             if (!allIpLists.TryGetValue(mappedUrl, out IpList? ipList))
                             {
                                 ipList = new IpList(_app._dnsServer!, mappedUrl, globalResolveIntervalSeconds, globalResolveDnsServers);
+                                allIpListZones: ; // placeholder removed in final version
                                 allIpLists[mappedUrl] = ipList;
                                 _ = ipList.LoadAsync();
                             }
@@ -294,7 +295,7 @@ namespace AdvancedBlockingWithUrlList
                             int resolveSec = ue.ResolveIntervalSeconds == 0 ? globalResolveIntervalSeconds : ue.ResolveIntervalSeconds;
                             IPAddress[]? dns = ue.ResolveDnsServers ?? globalResolveDnsServers;
                             ipList = new IpList(_app._dnsServer!, url, resolveSec, dns);
-                            allIpLists[url] = iplist: ipList;
+                            allIpLists[url] = ipList;
                             _ = ipList.LoadAsync();
                         }
                         _ipListZones[url] = ipList;
