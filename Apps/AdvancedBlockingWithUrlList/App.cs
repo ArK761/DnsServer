@@ -166,8 +166,6 @@ namespace AdvancedBlockingWithUrlList
                             _dnsServer.WriteLog("AdvancedBlockingWithUrlList: Group '" + g.Name + "' auto-linked to URL=" + mappedUrl.AbsoluteUri);
                         }
                     }
-
-                    g.LoadListZones(_allIpListZones, _nameToUrlMap);
                 }
 
                 _groups = groups;
@@ -326,8 +324,16 @@ namespace AdvancedBlockingWithUrlList
             readonly App _app;
             public string Name { get; }
             public bool EnableBlocking { get; }
+            public bool AllowTxtBlockingReport { get; }
             public bool BlockAsNxDomain { get; }
-            public UrlEntry[] IpListUrls { get; }
+            public string[] BlockingAddresses { get; }
+            public string[] Allowed { get; }
+            public string[] AllowListUrls { get; }
+            public string[] BlockListUrls { get; }
+            public string[] AllowedRegex { get; }
+            public string[] RegexAllowListUrls { get; }
+            public string[] RegexBlockListUrls { get; }
+            public string[] AdblockListUrls { get; }
 
             Dictionary<Uri, IpList> _ipListZones = new Dictionary<Uri, IpList>(UriComparer.Instance);
             HashSet<string> _blocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -338,24 +344,17 @@ namespace AdvancedBlockingWithUrlList
                 _app = app;
                 Name = json.GetProperty("name").GetString() ?? "default";
                 EnableBlocking = json.GetPropertyValue("enableBlocking", true);
+                AllowTxtBlockingReport = json.GetPropertyValue("allowTxtBlockingReport", false);
                 BlockAsNxDomain = json.GetPropertyValue("blockAsNxDomain", false);
 
-                if (json.TryGetProperty("ipListUrls", out JsonElement ipListUrls) && ipListUrls.ValueKind == JsonValueKind.Array)
-                {
-                    var entries = new List<UrlEntry>();
-                    foreach (var el in ipListUrls.EnumerateArray())
-                    {
-                        if (el.ValueKind == JsonValueKind.String)
-                            entries.Add(new UrlEntry(el.GetString()!));
-                        else if (el.ValueKind == JsonValueKind.Object)
-                            entries.Add(new UrlEntry(el));
-                    }
-                    IpListUrls = entries.ToArray();
-                }
-                else
-                {
-                    IpListUrls = Array.Empty<UrlEntry>();
-                }
+                BlockingAddresses = ParseStringArray(json, "blockingAddresses");
+                Allowed = ParseStringArray(json, "allowed");
+                AllowListUrls = ParseStringArray(json, "allowListUrls");
+                BlockListUrls = ParseStringArray(json, "blockListUrls");
+                AllowedRegex = ParseStringArray(json, "allowedRegex");
+                RegexAllowListUrls = ParseStringArray(json, "regexAllowListUrls");
+                RegexBlockListUrls = ParseStringArray(json, "regexBlockListUrls");
+                AdblockListUrls = ParseStringArray(json, "adblockListUrls");
 
                 if (json.TryGetProperty("blocked", out JsonElement blocked) && blocked.ValueKind == JsonValueKind.Array)
                 {
@@ -387,30 +386,26 @@ namespace AdvancedBlockingWithUrlList
                 }
             }
 
+            static string[] ParseStringArray(JsonElement json, string propertyName)
+            {
+                if (json.TryGetProperty(propertyName, out JsonElement arr) && arr.ValueKind == JsonValueKind.Array)
+                {
+                    var list = new List<string>();
+                    foreach (var el in arr.EnumerateArray())
+                    {
+                        string? s = el.GetString();
+                        if (!string.IsNullOrEmpty(s))
+                            list.Add(s);
+                    }
+                    return list.ToArray();
+                }
+                return Array.Empty<string>();
+            }
+
             public void AddIpListZone(Uri url, IpList ipList)
             {
                 if (!_ipListZones.ContainsKey(url))
                     _ipListZones[url] = ipList;
-            }
-
-            public void LoadListZones(Dictionary<Uri, IpList> allIpLists, Dictionary<string, Uri> nameToUrlMap)
-            {
-                foreach (var ue in IpListUrls)
-                {
-                    if (ue.IsName)
-                    {
-                        if (nameToUrlMap.TryGetValue(ue.Name!, out Uri? mappedUrl))
-                        {
-                            if (allIpLists.TryGetValue(mappedUrl, out IpList? ipList))
-                                _ipListZones[mappedUrl] = ipList;
-                        }
-                    }
-                    else if (ue.Uri is not null)
-                    {
-                        if (allIpLists.TryGetValue(ue.Uri, out IpList? ipList))
-                            _ipListZones[ue.Uri] = ipList;
-                    }
-                }
             }
 
             public bool IsClientInIpLists(IPAddress ip)
@@ -447,56 +442,6 @@ namespace AdvancedBlockingWithUrlList
                     catch { }
                 }
                 return false;
-            }
-        }
-
-        class UrlEntry
-        {
-            public Uri? Uri { get; }
-            public string? Name { get; }
-            public bool IsName => Name is not null;
-            public int ResolveIntervalSeconds { get; }
-            public IPAddress[]? ResolveDnsServers { get; }
-
-            public UrlEntry(string raw)
-            {
-                if (System.Uri.TryCreate(raw, UriKind.Absolute, out Uri? u))
-                { Uri = u; Name = null; }
-                else
-                { Name = raw; Uri = null; }
-                ResolveIntervalSeconds = 0;
-                ResolveDnsServers = null;
-            }
-
-            public UrlEntry(JsonElement el)
-            {
-                if (el.ValueKind == JsonValueKind.String)
-                {
-                    var s = el.GetString()!;
-                    if (System.Uri.TryCreate(s, UriKind.Absolute, out Uri? u2))
-                    { Uri = u2; Name = null; }
-                    else
-                    { Name = s; Uri = null; }
-                    ResolveIntervalSeconds = 0;
-                    ResolveDnsServers = null;
-                }
-                else
-                {
-                    string url = el.GetProperty("url").GetString()!;
-                    Uri = System.Uri.TryCreate(url, UriKind.Absolute, out Uri? u3) ? u3 : null;
-                    Name = null;
-                    ResolveIntervalSeconds = el.GetPropertyValue("resolveIntervalSeconds", 0);
-                    if (el.TryGetProperty("resolveDnsServers", out JsonElement dnsServers) && dnsServers.ValueKind == JsonValueKind.Array)
-                    {
-                        var list = new List<IPAddress>();
-                        foreach (var j in dnsServers.EnumerateArray())
-                        {
-                            if (IPAddress.TryParse(j.GetString(), out IPAddress? a))
-                                list.Add(a);
-                        }
-                        ResolveDnsServers = list.Count > 0 ? list.ToArray() : null;
-                    }
-                }
             }
         }
 
