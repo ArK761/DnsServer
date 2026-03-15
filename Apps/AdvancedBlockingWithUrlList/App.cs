@@ -622,4 +622,28 @@ namespace AdvancedBlockingWithUrlList
             }
         }
     }
+
+    static class JsonElementExtensions
+    {
+        public static bool GetPropertyValue(this JsonElement element, string propertyName, bool defaultValue)
+        {
+            if (element.TryGetProperty(propertyName, out JsonElement value) && (value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False))
+                return value.GetBoolean();
+            return defaultValue;
+        }
+
+        public static int GetPropertyValue(this JsonElement element, string propertyName, int defaultValue)
+        {
+            if (element.TryGetProperty(propertyName, out JsonElement value) && value.ValueKind == JsonValueKind.Number)
+                return value.GetInt32();
+            return defaultValue;
+        }
+
+        public static uint GetPropertyValue(this JsonElement element, string propertyName, uint defaultValue)
+        {
+            if (element.TryGetProperty(propertyName, out JsonElement value) && value.ValueKind == JsonValueKind.Number)
+                return value.GetUInt32();
+            return defaultValue;
+        }
+    }
 }
