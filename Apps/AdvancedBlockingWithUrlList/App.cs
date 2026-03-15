@@ -279,6 +279,7 @@ namespace AdvancedBlockingWithUrlList
 
         public Task<DnsDatagram?> ProcessRequestAsync(DnsDatagram request, IPEndPoint remoteEP)
         {
+    _dnsServer.WriteLog("ABWL: ProcessRequestAsync called from " + remoteEP.Address);
             if (!_enableBlocking)
                 return Task.FromResult<DnsDatagram?>(null);
 
@@ -289,9 +290,13 @@ namespace AdvancedBlockingWithUrlList
                     var g = kv.Value;
                     if (!g.EnableBlocking) continue;
 
-                    if (!g.IsClientInIpLists(remoteEP.Address))
-                        continue;
+IPAddress clientIp = remoteEP.Address;
 
+if (clientIp.AddressFamily == AddressFamily.InterNetworkV6 && clientIp.IsIPv4MappedToIPv6)
+    clientIp = clientIp.MapToIPv4();
+
+if (!g.IsClientInIpLists(clientIp))
+    continue;
                     DnsQuestionRecord q = request.Question[0];
 
                     if (g.IsZoneBlocked(q.Name))
