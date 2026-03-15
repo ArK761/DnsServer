@@ -1,9 +1,12 @@
 /*
  AdvancedBlockingWithUrlList
- New app that supports URL-based IP lists (each line an IP or hostname).
- Hostnames can be resolved periodically and with optional per-list DNS servers.
- This file is intentionally written to be a standalone app (namespace AdvancedBlockingWithUrlList)
- so it doesn't modify the existing AdvancedBlockingApp.
+ Supports:
+  - ipListMaps (URL -> name)
+  - ipListUrls in groups can reference either URL or name from ipListMaps
+  - global refresh interval (minutes) via blockListUrlUpdateIntervalMinutes
+  - global resolve interval (seconds) via ipListResolveIntervalSeconds
+  - global resolve DNS servers via ipListResolveDnsServers
+  - removed networkGroupMap and localEndPointGroupMap
 */
 
 using DnsServerCore.ApplicationCommon;
@@ -12,11 +15,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Http;
-using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using TechnitiumLibrary.Net;
@@ -25,8 +26,6 @@ using TechnitiumLibrary.Net.Dns.ResourceRecords;
 
 namespace AdvancedBlockingWithUrlList
 {
-    // Minimal "app" implementing core features. It follows existing repository patterns
-    // but focuses on adding IpList support and wiring it into group selection.
     public sealed class App : IDnsApplication, IDisposable
     {
         IDnsServer? _dnsServer;
@@ -34,16 +33,19 @@ namespace AdvancedBlockingWithUrlList
         bool _enableBlocking = true;
         uint _blockingAnswerTtl = 30;
 
-        Dictionary<EndPoint, string>? _localEndPointGroupMap;
-        Dictionary<NetworkAddress, string>? _networkGroupMap;
+        // groups parsed from config
         Dictionary<string, Group>? _groups;
 
-        Dictionary<Uri, IpList> _allIpListZones = new Dictionary<Uri, IpList>();
+        // all IpList instances keyed by URL
+        Dictionary<Uri, IpList> _allIpListZones = new Dictionary<Uri, IpList>(UriComparer.Instance);
+
+        // map name->url (derived from ipListMaps where value is name)
+        Dictionary<string, Uri> _nameToUrlMap = new Dictionary<string, Uri>(StringComparer.OrdinalIgnoreCase);
 
         Timer? _updateTimer;
-        DateTime _lastUpdate = DateTime.UtcNow;
-
-        const int UPDATE_CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
+        int _refreshIntervalMinutes = 1440; // default 1 day
+        int _globalResolveIntervalSeconds = 3600;
+        IPAddress[]? _globalResolveDnsServers;
 
         public void Dispose()
         {
@@ -51,64 +53,65 @@ namespace AdvancedBlockingWithUrlList
             _updateTimer = null;
         }
 
-        public string Description => "AdvancedBlockingWithUrlList: Blocking with URL-based IP lists (IP or hostname lines) with optional per-list DNS and resolve interval.";
+        public string Description => "AdvancedBlockingWithUrlList: URL-based IP lists with global refresh and resolve settings. No local/network maps.";
 
         public async Task InitializeAsync(IDnsServer dnsServer, string config)
         {
             _dnsServer = dnsServer;
 
-            // parse config
             JsonDocument doc = JsonDocument.Parse(config);
             JsonElement root = doc.RootElement;
 
             _enableBlocking = root.GetPropertyValue("enableBlocking", true);
             _blockingAnswerTtl = root.GetPropertyValue("blockingAnswerTtl", 30u);
 
-            // local endpoint map (optional)
-            if (root.TryGetProperty("localEndPointGroupMap", out JsonElement localEPMap) && localEPMap.ValueKind == JsonValueKind.Object)
+            _refreshIntervalMinutes = root.GetPropertyValue("blockListUrlUpdateIntervalMinutes", 1440);
+            _globalResolveIntervalSeconds = root.GetPropertyValue("ipListResolveIntervalSeconds", 3600);
+
+            if (root.TryGetProperty("ipListResolveDnsServers", out JsonElement dnsServers) && dnsServers.ValueKind == JsonValueKind.Array)
             {
-                var map = new Dictionary<EndPoint, string>();
-                foreach (JsonProperty p in localEPMap.EnumerateObject())
+                var list = new List<IPAddress>();
+                foreach (var j in dnsServers.EnumerateArray())
                 {
-                    // expecting "address:port": "group"
-                    string key = p.Name;
-                    string value = p.Value.GetString() ?? "";
-                    // Try simple parse: ip:port or host:port
-                    try
-                    {
-                        if (IPEndPoint.TryParse(key, out IPEndPoint? ipep))
-                            map[ipep] = value;
-                        else
-                        {
-                            // domain:port or plain
-                            string[] parts = key.Split(':', 2);
-                            if (parts.Length == 2 && int.TryParse(parts[1], out int port))
-                                map[new DnsEndPoint(parts[0], port)] = value;
-                        }
-                    }
-                    catch { }
+                    if (IPAddress.TryParse(j.GetString(), out IPAddress? a))
+                        list.Add(a);
                 }
-                _localEndPointGroupMap = map;
+                _globalResolveDnsServers = list.Count > 0 ? list.ToArray() : null;
             }
 
-            // networkGroupMap (optional)
-            if (root.TryGetProperty("networkGroupMap", out JsonElement networkMap) && networkMap.ValueKind == JsonValueKind.Object)
+            // ipListMaps: URL -> name (string)
+            if (root.TryGetProperty("ipListMaps", out JsonElement mapsElem) && mapsElem.ValueKind == JsonValueKind.Object)
             {
-                var map = new Dictionary<NetworkAddress, string>();
-                foreach (JsonProperty p in networkMap.EnumerateObject())
+                foreach (JsonProperty p in mapsElem.EnumerateObject())
                 {
-                    string key = p.Name;
-                    string value = p.Value.GetString() ?? "";
-                    if (NetworkAddress.TryParse(key, out NetworkAddress na))
-                        map[na] = value;
+                    string urlText = p.Name;
+                    string? name = p.Value.ValueKind == JsonValueKind.String ? p.Value.GetString() : null;
+                    if (string.IsNullOrEmpty(name)) continue;
+                    if (Uri.TryCreate(urlText, UriKind.Absolute, out Uri? u))
+                    {
+                        try
+                        {
+                            // store name->url
+                            if (!_nameToUrlMap.ContainsKey(name))
+                                _nameToUrlMap[name] = u;
+                            // create IpList instance for this url (use global resolve interval/dns)
+                            if (!_allIpListZones.ContainsKey(u))
+                            {
+                                var iplist = new IpList(_dnsServer, u, _globalResolveIntervalSeconds, _globalResolveDnsServers);
+                                _allIpListZones[u] = iplist;
+                                // initial load async (fire and forget safe)
+                                _ = iplist.LoadAsync();
+                            }
+                        }
+                        catch { }
+                    }
                 }
-                _networkGroupMap = map;
             }
 
             // parse groups
             if (root.TryGetProperty("groups", out JsonElement groupsElement) && groupsElement.ValueKind == JsonValueKind.Array)
             {
-                var groups = new Dictionary<string, Group>();
+                var groups = new Dictionary<string, Group>(StringComparer.OrdinalIgnoreCase);
 
                 foreach (JsonElement ge in groupsElement.EnumerateArray())
                 {
@@ -116,34 +119,17 @@ namespace AdvancedBlockingWithUrlList
                     groups[g.Name] = g;
                 }
 
-                // Build shared ip-list instances for distinct URIs
-                var ipLists = new Dictionary<Uri, IpList>();
+                // resolve ipListUrls in each group and ensure IpList instances exist
                 foreach (var kv in groups)
                 {
-                    foreach (UrlEntry ue in kv.Value.IpListUrls)
-                    {
-                        if (ue.Uri is null)
-                            continue;
-                        if (!ipLists.ContainsKey(ue.Uri))
-                        {
-                            var iplist = new IpList(_dnsServer, ue.Uri, ue.ResolveIntervalSeconds == 0 ? 3600 : ue.ResolveIntervalSeconds, ue.ResolveDnsServers);
-                            ipLists[ue.Uri] = iplist;
-                        }
-                    }
-                }
-
-                _allIpListZones = ipLists;
-
-                // let each group resolve their zone entries mapping to instances
-                foreach (var kv in groups)
-                {
-                    kv.Value.LoadListZones(_allIpListZones);
+                    kv.Value.LoadListZones(_allIpListZones, _nameToUrlMap, _globalResolveIntervalSeconds, _globalResolveDnsServers);
                 }
 
                 _groups = groups;
             }
 
-            // schedule periodic updates (download + optional resolves)
+            // schedule periodic updates (download + optional resolves) using minutes interval
+            var due = TimeSpan.FromMinutes(Math.Max(1, _refreshIntervalMinutes));
             _updateTimer = new Timer(async _ =>
             {
                 try
@@ -154,16 +140,14 @@ namespace AdvancedBlockingWithUrlList
                 {
                     _dnsServer?.WriteLog(ex);
                 }
-            }, null, UPDATE_CHECK_INTERVAL_MS, UPDATE_CHECK_INTERVAL_MS);
+            }, null, due, due);
         }
 
         async Task UpdateAllAsync()
         {
-            // Download/update all ip lists
             List<Task<bool>> tasks = new List<Task<bool>>();
             foreach (var kv in _allIpListZones)
                 tasks.Add(kv.Value.UpdateAsync());
-
             if (tasks.Count > 0)
             {
                 await Task.WhenAll(tasks);
@@ -172,142 +156,61 @@ namespace AdvancedBlockingWithUrlList
 
         public Task<bool> IsAllowedAsync(DnsDatagram request, IPEndPoint remoteEP)
         {
-            // For compatibility, IsAllowed returns false when not blocked (allowed).
             if (!_enableBlocking)
                 return Task.FromResult(true);
 
-            string? group = GetGroupName(request, remoteEP);
-            if (group is null) return Task.FromResult(true);
-            if (_groups is null || !_groups.TryGetValue(group, out Group? g)) return Task.FromResult(true);
-
-            // Simple check: if group enabled and zone is blocked, disallow (return false)
-            DnsQuestionRecord q = request.Question[0];
-            if (g.IsZoneBlocked(q.Name, out _, out _, out _))
-                return Task.FromResult(false);
-            return Task.FromResult(true);
-        }
-
-        public Task<DnsDatagram?> ProcessRequestAsync(DnsDatagram request, IPEndPoint remoteEP)
-        {
-            // If blocked, return blocking response (simple NXDOMAIN or provided addresses).
-            if (!_enableBlocking)
-                return Task.FromResult<DnsDatagram?>(null);
-
-            string? group = GetGroupName(request, remoteEP);
-            if (group is null) return Task.FromResult<DnsDatagram?>(null);
-            if (_groups is null || !_groups.TryGetValue(group, out Group? g)) return Task.FromResult<DnsDatagram?>(null);
-
-            DnsQuestionRecord q = request.Question[0];
-            if (!g.IsZoneBlocked(q.Name, out string? blockedDomain, out string? blockedRegex, out UrlEntry? blockUrl))
-                return Task.FromResult<DnsDatagram?>(null);
-
-            // Return NXDOMAIN (simple)
-            DnsResourceRecord[]? auth = null;
-            var soa = new DnsSOARecordData(_dnsServer!.ServerDomain, _dnsServer.ResponsiblePerson.Address, 1, 3600, 600, 86400, _blockingAnswerTtl);
-            auth = new DnsResourceRecord[] { new DnsResourceRecord(q.Name, DnsResourceRecordType.SOA, q.Class, _blockingAnswerTtl, soa) };
-            var resp = new DnsDatagram(request.Identifier, true, DnsOpcode.StandardQuery, false, false, request.RecursionDesired, false, false, false, DnsResponseCode.NxDomain, request.Question, null, auth);
-            return Task.FromResult<DnsDatagram?>(resp);
-        }
-
-        // Determine group by local endpoint mapping, ip-lists, then network map
-        string? GetGroupName(DnsDatagram request, IPEndPoint remoteEP)
-        {
-            // check local endpoint map (if available)
-            if (_localEndPointGroupMap is not null && request.Metadata is not null)
-            {
-                // simplified: iterate map for any matching endpoints; exact matching logic may be extended
-                foreach (var kv in _localEndPointGroupMap)
-                {
-                    if (kv.Key is IPEndPoint ipep && request.Metadata.NameServer?.IPEndPoint is not null)
-                    {
-                        if (ipep.Address.Equals(request.Metadata.NameServer.IPEndPoint.Address))
-                            return kv.Value;
-                    }
-                }
-            }
-
-            // check per-group ip lists first
+            // Determine group only by client IP membership in ip lists
             if (_groups is not null)
             {
-                foreach (var g in _groups)
+                foreach (var kv in _groups)
                 {
                     try
                     {
-                        if (g.Value.IsClientInIpLists(remoteEP.Address))
-                            return g.Key;
+                        if (kv.Value.IsClientInIpLists(remoteEP.Address))
+                            return Task.FromResult(!kv.Value.EnableBlocking ? true : false);
                     }
                     catch { }
                 }
             }
 
-            // then check networkGroupMap
-            if (_networkGroupMap is not null)
+            return Task.FromResult(true);
+        }
+
+        public Task<DnsDatagram?> ProcessRequestAsync(DnsDatagram request, IPEndPoint remoteEP)
+        {
+            if (!_enableBlocking)
+                return Task.FromResult<DnsDatagram?>(null);
+
+            if (_groups is not null)
             {
-                NetworkAddress? selected = null;
-                string? name = null;
-                foreach (var kv in _networkGroupMap)
+                foreach (var kv in _groups)
                 {
-                    if (kv.Key.Contains(remoteEP.Address))
+                    var g = kv.Value;
+                    if (!g.EnableBlocking) continue;
+                    DnsQuestionRecord q = request.Question[0];
+                    if (g.IsZoneBlocked(q.Name, out _, out _, out _))
                     {
-                        if (selected is null || kv.Key.PrefixLength > selected.PrefixLength)
-                        {
-                            selected = kv.Key;
-                            name = kv.Value;
-                        }
+                        var soa = new DnsSOARecordData(_dnsServer!.ServerDomain, _dnsServer.ResponsiblePerson.Address, 1, 3600, 600, 86400, _blockingAnswerTtl);
+                        var auth = new DnsResourceRecord[] { new DnsResourceRecord(q.Name, DnsResourceRecordType.SOA, q.Class, _blockingAnswerTtl, soa) };
+                        var resp = new DnsDatagram(request.Identifier, true, DnsOpcode.StandardQuery, false, false, request.RecursionDesired, false, false, false, DnsResponseCode.NxDomain, request.Question, null, auth);
+                        return Task.FromResult<DnsDatagram?>(resp);
                     }
                 }
-                return name;
             }
 
-            return null;
+            return Task.FromResult<DnsDatagram?>(null);
         }
 
         // --------------------
         // Helper / nested types
         // --------------------
 
-        // UrlEntry supports either string url or object { url, resolveIntervalSeconds, resolveDnsServers }
-        class UrlEntry
+        // compare Uri by absolute uri
+        class UriComparer : IEqualityComparer<Uri>
         {
-            public Uri? Uri { get; }
-            public int ResolveIntervalSeconds { get; }
-            public IPAddress[]? ResolveDnsServers { get; }
-            public bool BlockAsNxDomain { get; }
-
-            public UrlEntry(JsonElement el)
-            {
-                if (el.ValueKind == JsonValueKind.String)
-                {
-                    Uri = new Uri(el.GetString()!);
-                    ResolveIntervalSeconds = 0;
-                    ResolveDnsServers = null;
-                    BlockAsNxDomain = false;
-                }
-                else
-                {
-                    Uri = new Uri(el.GetProperty("url").GetString()!);
-                    ResolveIntervalSeconds = el.GetPropertyValue("resolveIntervalSeconds", 0);
-                    BlockAsNxDomain = el.GetPropertyValue("blockAsNxDomain", false);
-                    if (el.TryGetProperty("resolveDnsServers", out JsonElement dnsServers) && dnsServers.ValueKind == JsonValueKind.Array)
-                    {
-                        var list = new List<IPAddress>();
-                        foreach (var j in dnsServers.EnumerateArray())
-                        {
-                            if (IPAddress.TryParse(j.GetString(), out IPAddress? a))
-                                list.Add(a);
-                        }
-                        ResolveDnsServers = list.Count > 0 ? list.ToArray() : null;
-                    }
-                }
-            }
-
-            public UrlEntry(Uri uri)
-            {
-                Uri = uri;
-                ResolveIntervalSeconds = 0;
-                ResolveDnsServers = null;
-                BlockAsNxDomain = false;
-            }
+            public static readonly UriComparer Instance = new UriComparer();
+            public bool Equals(Uri? x, Uri? y) => StringComparer.OrdinalIgnoreCase.Equals(x?.AbsoluteUri, y?.AbsoluteUri);
+            public int GetHashCode(Uri obj) => StringComparer.OrdinalIgnoreCase.GetHashCode(obj.AbsoluteUri);
         }
 
         class Group
@@ -317,11 +220,11 @@ namespace AdvancedBlockingWithUrlList
             public bool EnableBlocking { get; }
             public bool BlockAsNxDomain { get; }
 
+            // ip list references: can be URL, name (resolved via ipListMaps) or per-list object
             public UrlEntry[] IpListUrls { get; }
 
-            Dictionary<Uri, IpList> _ipListZones = new Dictionary<Uri, IpList>();
+            Dictionary<Uri, IpList> _ipListZones = new Dictionary<Uri, IpList>(UriComparer.Instance);
 
-            // minimal allowed/blocked structures for blocking by zone name
             HashSet<string> _blocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             public Group(App app, JsonElement json)
@@ -335,13 +238,23 @@ namespace AdvancedBlockingWithUrlList
                 {
                     var entries = new List<UrlEntry>();
                     foreach (var el in ipListUrls.EnumerateArray())
-                        entries.Add(new UrlEntry(el));
+                    {
+                        if (el.ValueKind == JsonValueKind.String)
+                        {
+                            entries.Add(new UrlEntry(el.GetString()!));
+                        }
+                        else if (el.ValueKind == JsonValueKind.Object)
+                        {
+                            entries.Add(new UrlEntry(el));
+                        }
+                    }
                     IpListUrls = entries.ToArray();
                 }
                 else
+                {
                     IpListUrls = Array.Empty<UrlEntry>();
+                }
 
-                // optional blocked domains
                 if (json.TryGetProperty("blocked", out JsonElement blocked) && blocked.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var b in blocked.EnumerateArray())
@@ -353,13 +266,39 @@ namespace AdvancedBlockingWithUrlList
                 }
             }
 
-            public void LoadListZones(Dictionary<Uri, IpList> allIpLists)
+            // load mapping from global allIpLists (ensure instances exist for each referenced URL)
+            public void LoadListZones(Dictionary<Uri, IpList> allIpLists, Dictionary<string, Uri> nameToUrlMap, int globalResolveIntervalSeconds, IPAddress[]? globalResolveDnsServers)
             {
                 foreach (var ue in IpListUrls)
                 {
-                    if (ue.Uri is null) continue;
-                    if (allIpLists.TryGetValue(ue.Uri, out IpList? ipList))
-                        _ipListZones[ue.Uri] = ipList;
+                    if (ue.IsName)
+                    {
+                        if (nameToUrlMap.TryGetValue(ue.Name!, out Uri? mappedUrl))
+                        {
+                            // if IpList for url not present in global map, create with global settings
+                            if (!allIpLists.TryGetValue(mappedUrl, out IpList? ipList))
+                            {
+                                ipList = new IpList(_app._dnsServer!, mappedUrl, globalResolveIntervalSeconds, globalResolveDnsServers);
+                                allIpLists[mappedUrl] = ipList;
+                                _ = ipList.LoadAsync();
+                            }
+                            _ipListZones[mappedUrl] = ipList;
+                        }
+                    }
+                    else if (ue.Uri is not null)
+                    {
+                        var url = ue.Uri;
+                        if (!allIpLists.TryGetValue(url, out IpList? ipList))
+                        {
+                            // if entry has custom resolve settings, use them; otherwise global
+                            int resolveSec = ue.ResolveIntervalSeconds == 0 ? globalResolveIntervalSeconds : ue.ResolveIntervalSeconds;
+                            IPAddress[]? dns = ue.ResolveDnsServers ?? globalResolveDnsServers;
+                            ipList = new IpList(_app._dnsServer!, url, resolveSec, dns);
+                            allIpLists[url] = iplist: ipList;
+                            _ = ipList.LoadAsync();
+                        }
+                        _ipListZones[url] = ipList;
+                    }
                 }
             }
 
@@ -392,7 +331,75 @@ namespace AdvancedBlockingWithUrlList
             }
         }
 
-        // Minimal ListBase: downloads file and tracks last modified; used by IpList.
+        // UrlEntry: supports string names, string URLs or object { url, resolveIntervalSeconds, resolveDnsServers }
+        class UrlEntry
+        {
+            public Uri? Uri { get; }
+            public string? Name { get; }
+            public bool IsName => Name is not null;
+            public int ResolveIntervalSeconds { get; }
+            public IPAddress[]? ResolveDnsServers { get; }
+
+            public UrlEntry(string raw)
+            {
+                // raw could be name (List1) or direct URL
+                if (Uri.TryCreate(raw, UriKind.Absolute, out Uri? u))
+                {
+                    Uri = u;
+                    Name = null;
+                    ResolveIntervalSeconds = 0;
+                    ResolveDnsServers = null;
+                }
+                else
+                {
+                    // treat as name
+                    Name = raw;
+                    Uri = null;
+                    ResolveIntervalSeconds = 0;
+                    ResolveDnsServers = null;
+                }
+            }
+
+            public UrlEntry(JsonElement el)
+            {
+                if (el.ValueKind == JsonValueKind.String)
+                {
+                    var s = el.GetString()!;
+                    if (Uri.TryCreate(s, UriKind.Absolute, out Uri? u))
+                    {
+                        Uri = u;
+                        Name = null;
+                    }
+                    else
+                    {
+                        Name = s;
+                        Uri = null;
+                    }
+                    ResolveIntervalSeconds = 0;
+                    ResolveDnsServers = null;
+                }
+                else
+                {
+                    // object
+                    string url = el.GetProperty("url").GetString()!;
+                    Uri = Uri.TryCreate(url, UriKind.Absolute, out Uri? u2) ? u2 : null;
+                    Name = null;
+                    ResolveIntervalSeconds = el.GetPropertyValue("resolveIntervalSeconds", 0);
+                    if (el.TryGetProperty("resolveDnsServers", out JsonElement dnsServers) && dnsServers.ValueKind == JsonValueKind.Array)
+                    {
+                        var list = new List<IPAddress>();
+                        foreach (var j in dnsServers.EnumerateArray())
+                        {
+                            if (IPAddress.TryParse(j.GetString(), out IPAddress? a))
+                                list.Add(a);
+                        }
+                        ResolveDnsServers = list.Count > 0 ? list.ToArray() : null;
+                    }
+                }
+            }
+        }
+
+        // Minimal ListBase and IpList (same behavior as prior implementation, unchanged)
         abstract class ListBase
         {
             protected readonly IDnsServer _dnsServer;
@@ -457,7 +464,6 @@ namespace AdvancedBlockingWithUrlList
             }
         }
 
-        // IpList: parses file lines (IP or hostname) and optionally resolves hostnames.
         class IpList : ListBase
         {
             readonly int _resolveIntervalSeconds;
@@ -477,7 +483,6 @@ namespace AdvancedBlockingWithUrlList
 
             public async Task LoadAsync()
             {
-                // if file not present, try to download once
                 await DownloadListFileAsync();
                 LoadFromFile();
                 await ResolveHostnamesAsync();
@@ -549,7 +554,6 @@ namespace AdvancedBlockingWithUrlList
                     {
                         try
                         {
-                            // prefer A and AAAA based on server preference
                             if (_resolveDnsServers is not null && _resolveDnsServers.Length > 0)
                             {
                                 DnsClient client = new DnsClient(_resolveDnsServers);
