@@ -267,7 +267,11 @@ namespace AdvancedBlockingWithUrlList
             }
 
             // load mapping from global allIpLists (ensure instances exist for each referenced URL)
-            public void LoadListZones(Dictionary<Uri, IpList> allIpLists, Dictionary<string, Uri> nameToUrlMap, int globalResolveIntervalSeconds, IPAddress[]? globalResolveDnsServers)
+            public void LoadListZones(
+                Dictionary<Uri, IpList> allIpLists,
+                Dictionary<string, Uri> nameToUrlMap,
+                int globalResolveIntervalSeconds,
+                IPAddress[]? globalResolveDnsServers)
             {
                 foreach (var ue in IpListUrls)
                 {
@@ -279,7 +283,6 @@ namespace AdvancedBlockingWithUrlList
                             if (!allIpLists.TryGetValue(mappedUrl, out IpList? ipList))
                             {
                                 ipList = new IpList(_app._dnsServer!, mappedUrl, globalResolveIntervalSeconds, globalResolveDnsServers);
-                                allIpListZones: ; // placeholder removed in final version
                                 allIpLists[mappedUrl] = ipList;
                                 _ = ipList.LoadAsync();
                             }
