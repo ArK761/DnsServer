@@ -64,6 +64,7 @@ namespace AdvancedBlocking
         Dictionary<Uri, RegexList> _allRegexBlockListZones = [];
 
         Dictionary<Uri, AdBlockList> _allAdBlockListZones = [];
+        Dictionary<Uri, IpList> _allIpListZones = [];
 
         Timer? _blockListUrlUpdateTimer;
         DateTime _blockListUrlLastUpdatedOn;
@@ -124,6 +125,9 @@ namespace AdvancedBlocking
 
             foreach (KeyValuePair<Uri, AdBlockList> allAdBlockListZone in _allAdBlockListZones)
                 updateTasks.Add(allAdBlockListZone.Value.UpdateAsync());
+
+            foreach (KeyValuePair<Uri, IpList> allIpListZone in _allIpListZones)
+                updateTasks.Add(allIpListZone.Value.UpdateAsync());
 
             await Task.WhenAll(updateTasks);
 
@@ -325,6 +329,13 @@ namespace AdvancedBlocking
             IPAddress remoteIP = remoteEP.Address;
             NetworkAddress? network = null;
 
+            //check IP lists in each group for a specific match
+            foreach (KeyValuePair<string, Group> groupEntry in _groups!)
+            {
+                if (groupEntry.Value.IsIpFound(remoteIP))
+                    return groupEntry.Value.Name;
+            }
+
             foreach (KeyValuePair<NetworkAddress, string> entry in _networkGroupMap!)
             {
                 if (entry.Key.Contains(remoteIP) && ((network is null) || (entry.Key.PrefixLength > network.PrefixLength)))
@@ -386,6 +397,7 @@ namespace AdvancedBlocking
                 Dictionary<Uri, RegexList> allRegexBlockListZones = new Dictionary<Uri, RegexList>(0);
 
                 Dictionary<Uri, AdBlockList> allAdBlockListZones = new Dictionary<Uri, AdBlockList>(0);
+                Dictionary<Uri, IpList> allIpListZones = new Dictionary<Uri, IpList>(0);
 
                 _groups = jsonConfig.ReadArrayAsMap("groups", delegate (JsonElement jsonGroup)
                 {
@@ -446,6 +458,17 @@ namespace AdvancedBlocking
                         }
                     }
 
+                    foreach (IpListEntry ipListUrl in group.IpListUrls)
+                    {
+                        if (!allIpListZones.ContainsKey(ipListUrl.Uri))
+                        {
+                            if (_allIpListZones.TryGetValue(ipListUrl.Uri, out IpList? ipList))
+                                allIpListZones.Add(ipListUrl.Uri, ipList);
+                            else
+                                allIpListZones.Add(ipListUrl.Uri, new IpList(_dnsServer, ipListUrl.Uri, ipListUrl.ResolveIntervalSeconds, ipListUrl.ResolveDnsServers));
+                        }
+                    }
+
                     return new Tuple<string, Group>(group.Name, group);
                 });
 
@@ -456,6 +479,7 @@ namespace AdvancedBlocking
                 _allRegexBlockListZones = allRegexBlockListZones;
 
                 _allAdBlockListZones = allAdBlockListZones;
+                _allIpListZones = allIpListZones;
             }
 
             foreach (KeyValuePair<string, Group> group in _groups)
@@ -484,6 +508,9 @@ namespace AdvancedBlocking
 
                     foreach (KeyValuePair<Uri, AdBlockList> allAdBlockListZone in _allAdBlockListZones)
                         loadTasks.Add(allAdBlockListZone.Value.LoadAsync());
+
+                    foreach (KeyValuePair<Uri, IpList> allIpListZone in _allIpListZones)
+                        loadTasks.Add(allIpListZone.Value.LoadAsync());
 
                     await Task.WhenAll(loadTasks);
 
@@ -519,6 +546,12 @@ namespace AdvancedBlocking
                         {
                             if (allAdBlockListZone.Value.LastModified > latest)
                                 latest = allAdBlockListZone.Value.LastModified;
+                        }
+
+                        foreach (KeyValuePair<Uri, IpList> allIpListZone in _allIpListZones)
+                        {
+                            if (allIpListZone.Value.LastModified > latest)
+                                latest = allIpListZone.Value.LastModified;
                         }
 
                         _blockListUrlLastUpdatedOn = latest;
@@ -811,6 +844,73 @@ namespace AdvancedBlocking
             #endregion
         }
 
+        class IpListEntry
+        {
+            #region variables
+
+            readonly Uri _uri;
+            readonly int _resolveIntervalSeconds;
+            readonly NameServerAddress[]? _resolveDnsServers;
+
+            #endregion
+
+            #region constructor
+
+            public IpListEntry(JsonElement jsonUrl)
+            {
+                switch (jsonUrl.ValueKind)
+                {
+                    case JsonValueKind.String:
+                        _uri = new Uri(jsonUrl.GetString()!);
+                        _resolveIntervalSeconds = 0;
+                        _resolveDnsServers = null;
+                        break;
+
+                    case JsonValueKind.Object:
+                        _uri = new Uri(jsonUrl.GetProperty("url").GetString()!);
+                        _resolveIntervalSeconds = jsonUrl.GetPropertyValue("resolveIntervalSeconds", 0);
+
+                        if (jsonUrl.TryGetProperty("resolveDnsServers", out JsonElement jsonDnsServers))
+                        {
+                            List<NameServerAddress> servers = new List<NameServerAddress>();
+
+                            foreach (JsonElement jsonServer in jsonDnsServers.EnumerateArray())
+                            {
+                                string? ipStr = jsonServer.GetString();
+                                if (ipStr is not null && IPAddress.TryParse(ipStr, out IPAddress? addr))
+                                    servers.Add(new NameServerAddress(addr));
+                            }
+
+                            _resolveDnsServers = servers.Count > 0 ? servers.ToArray() : null;
+                        }
+                        else
+                        {
+                            _resolveDnsServers = null;
+                        }
+
+                        break;
+
+                    default:
+                        throw new InvalidDataException("Unexpected URL format: " + jsonUrl.ValueKind);
+                }
+            }
+
+            #endregion
+
+            #region properties
+
+            public Uri Uri
+            { get { return _uri; } }
+
+            public int ResolveIntervalSeconds
+            { get { return _resolveIntervalSeconds; } }
+
+            public NameServerAddress[]? ResolveDnsServers
+            { get { return _resolveDnsServers; } }
+
+            #endregion
+        }
+
         class ListZoneEntry<T> where T : ListBase
         {
             #region variables
@@ -866,6 +966,7 @@ namespace AdvancedBlocking
             readonly UrlEntry[] _regexBlockListUrls;
 
             readonly UrlEntry[] _adblockListUrls;
+            readonly IpListEntry[] _ipListUrls;
 
             Dictionary<Uri, BlockList> _allowListZones = [];
             Dictionary<Uri, ListZoneEntry<BlockList>> _blockListZones = [];
@@ -874,6 +975,7 @@ namespace AdvancedBlocking
             Dictionary<Uri, ListZoneEntry<RegexList>> _regexBlockListZones = [];
 
             Dictionary<Uri, ListZoneEntry<AdBlockList>> _adBlockListZones = [];
+            Dictionary<Uri, IpList> _ipListZones = [];
 
             #endregion
 
@@ -932,6 +1034,7 @@ namespace AdvancedBlocking
                 _regexBlockListUrls = jsonGroup.ReadArray("regexBlockListUrls", GetUrlEntry);
 
                 _adblockListUrls = jsonGroup.ReadArray("adblockListUrls", GetUrlEntry);
+                _ipListUrls = jsonGroup.ReadArray("ipListUrls", GetIpListEntry);
             }
 
             #endregion
@@ -946,6 +1049,11 @@ namespace AdvancedBlocking
             private UrlEntry GetUrlEntry(JsonElement jsonUrl)
             {
                 return new UrlEntry(jsonUrl, this);
+            }
+
+            private static IpListEntry GetIpListEntry(JsonElement jsonUrl)
+            {
+                return new IpListEntry(jsonUrl);
             }
 
             private static Regex GetRegexEntry(string pattern)
@@ -1018,6 +1126,29 @@ namespace AdvancedBlocking
 
                     _adBlockListZones = adBlockListZones;
                 }
+
+                {
+                    Dictionary<Uri, IpList> ipListZones = new Dictionary<Uri, IpList>(_ipListUrls.Length);
+
+                    foreach (IpListEntry listUrl in _ipListUrls)
+                    {
+                        if (_app._allIpListZones.TryGetValue(listUrl.Uri, out IpList? ipListZone))
+                            ipListZones.TryAdd(listUrl.Uri, ipListZone);
+                    }
+
+                    _ipListZones = ipListZones;
+                }
+            }
+
+            public bool IsIpFound(IPAddress ip)
+            {
+                foreach (KeyValuePair<Uri, IpList> ipListZone in _ipListZones)
+                {
+                    if (ipListZone.Value.IsIpFound(ip))
+                        return true;
+                }
+
+                return false;
             }
 
             public bool IsZoneAllowed(string domain)
@@ -1125,6 +1256,9 @@ namespace AdvancedBlocking
             public UrlEntry[] AdblockListUrls
             { get { return _adblockListUrls; } }
 
+            public IpListEntry[] IpListUrls
+            { get { return _ipListUrls; } }
+
             #endregion
         }
 
@@ -1137,6 +1271,7 @@ namespace AdvancedBlocking
             protected readonly bool _isAllowList;
             protected readonly bool _isRegexList;
             protected readonly bool _isAdblockList;
+            protected readonly bool _isIpList;
 
             protected readonly string _listFilePath;
             bool _listZoneLoaded;
@@ -1148,13 +1283,14 @@ namespace AdvancedBlocking
 
             #region constructor
 
-            public ListBase(IDnsServer dnsServer, Uri listUrl, bool isAllowList, bool isRegexList, bool isAdblockList)
+            public ListBase(IDnsServer dnsServer, Uri listUrl, bool isAllowList, bool isRegexList, bool isAdblockList, bool isIpList = false)
             {
                 _dnsServer = dnsServer;
                 _listUrl = listUrl;
                 _isAllowList = isAllowList;
                 _isRegexList = isRegexList;
                 _isAdblockList = isAdblockList;
+                _isIpList = isIpList;
 
                 _listFilePath = Path.Combine(Path.Combine(_dnsServer.ApplicationFolder, "blocklists"), Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(_listUrl.AbsoluteUri))).ToLowerInvariant());
             }
@@ -1163,11 +1299,11 @@ namespace AdvancedBlocking
 
             #region private
 
-            private async Task<bool> DownloadListFileAsync()
+            protected async Task<bool> DownloadListFileAsync()
             {
                 try
                 {
-                    _dnsServer.WriteLog("Advanced Blocking app is downloading " + (_isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list: " + _listUrl.AbsoluteUri);
+                    _dnsServer.WriteLog("Advanced Blocking app is downloading " + (_isIpList ? "IP" : _isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list: " + _listUrl.AbsoluteUri);
 
                     if (_listUrl.IsFile)
                     {
@@ -1175,7 +1311,7 @@ namespace AdvancedBlocking
                         {
                             if (File.GetLastWriteTimeUtc(_listUrl.LocalPath) <= File.GetLastWriteTimeUtc(_listFilePath))
                             {
-                                _dnsServer.WriteLog("Advanced Blocking app successfully checked for a new update of the " + (_isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list: " + _listUrl.AbsoluteUri);
+                                _dnsServer.WriteLog("Advanced Blocking app successfully checked for a new update of the " + (_isIpList ? "IP" : _isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list: " + _listUrl.AbsoluteUri);
                                 return false;
                             }
                         }
@@ -1183,7 +1319,7 @@ namespace AdvancedBlocking
                         File.Copy(_listUrl.LocalPath, _listFilePath, true);
                         _lastModified = File.GetLastWriteTimeUtc(_listFilePath);
 
-                        _dnsServer.WriteLog("Advanced Blocking app successfully downloaded " + (_isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list (" + WebUtilities.GetFormattedSize(new FileInfo(_listFilePath).Length) + "): " + _listUrl.AbsoluteUri);
+                        _dnsServer.WriteLog("Advanced Blocking app successfully downloaded " + (_isIpList ? "IP" : _isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list (" + WebUtilities.GetFormattedSize(new FileInfo(_listFilePath).Length) + "): " + _listUrl.AbsoluteUri);
                         return true;
                     }
                     else
@@ -1224,11 +1360,11 @@ namespace AdvancedBlocking
                                         File.SetLastWriteTimeUtc(_listFilePath, _lastModified);
                                     }
 
-                                    _dnsServer.WriteLog("Advanced Blocking app successfully downloaded " + (_isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list (" + WebUtilities.GetFormattedSize(new FileInfo(_listFilePath).Length) + "): " + _listUrl.AbsoluteUri);
+                                    _dnsServer.WriteLog("Advanced Blocking app successfully downloaded " + (_isIpList ? "IP" : _isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list (" + WebUtilities.GetFormattedSize(new FileInfo(_listFilePath).Length) + "): " + _listUrl.AbsoluteUri);
                                     return true;
 
                                 case HttpStatusCode.NotModified:
-                                    _dnsServer.WriteLog("Advanced Blocking app successfully checked for a new update of the " + (_isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list: " + _listUrl.AbsoluteUri);
+                                    _dnsServer.WriteLog("Advanced Blocking app successfully checked for a new update of the " + (_isIpList ? "IP" : _isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list: " + _listUrl.AbsoluteUri);
                                     return false;
 
                                 default:
@@ -1239,7 +1375,7 @@ namespace AdvancedBlocking
                 }
                 catch (Exception ex)
                 {
-                    _dnsServer.WriteLog("Advanced Blocking app failed to download " + (_isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list and will use previously downloaded file (if available): " + _listUrl.AbsoluteUri + "\r\n" + ex.ToString());
+                    _dnsServer.WriteLog("Advanced Blocking app failed to download " + (_isIpList ? "IP" : _isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list and will use previously downloaded file (if available): " + _listUrl.AbsoluteUri + "\r\n" + ex.ToString());
                     return false;
                 }
             }
@@ -1254,7 +1390,7 @@ namespace AdvancedBlocking
 
             #region public
 
-            public async Task LoadAsync()
+            public virtual async Task LoadAsync()
             {
                 if (_isLoading)
                     return;
@@ -1272,7 +1408,7 @@ namespace AdvancedBlocking
                             File.Copy(_listUrl.LocalPath, _listFilePath, true);
                             _lastModified = File.GetLastWriteTimeUtc(_listFilePath);
 
-                            _dnsServer.WriteLog("Advanced Blocking app successfully downloaded " + (_isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list (" + WebUtilities.GetFormattedSize(new FileInfo(_listFilePath).Length) + "): " + _listUrl.AbsoluteUri);
+                            _dnsServer.WriteLog("Advanced Blocking app successfully downloaded " + (_isIpList ? "IP" : _isAdblockList ? "adblock" : (_isRegexList ? "regex " : "") + (_isAllowList ? "allow" : "block")) + " list (" + WebUtilities.GetFormattedSize(new FileInfo(_listFilePath).Length) + "): " + _listUrl.AbsoluteUri);
 
                             LoadListZone();
                             _listZoneLoaded = true;
@@ -1298,7 +1434,7 @@ namespace AdvancedBlocking
                 }
             }
 
-            public async Task<bool> UpdateAsync()
+            public virtual async Task<bool> UpdateAsync()
             {
                 if (await DownloadListFileAsync())
                 {
@@ -1705,6 +1841,212 @@ namespace AdvancedBlocking
             public bool IsZoneBlocked(string domain, out string? foundZone)
             {
                 return IsZoneFound(_blockedListZone, domain, out foundZone);
+            }
+
+            #endregion
+        }
+
+        class IpList : ListBase
+        {
+            #region variables
+
+            readonly int _resolveIntervalSeconds;
+            readonly NameServerAddress[]? _resolveDnsServers;
+
+            HashSet<IPAddress> _baseIPs = [];        //IPs parsed directly from the list file
+            HashSet<IPAddress> _resolvedIPs = [];    //combined: base IPs + IPs resolved from hostnames
+            HashSet<string> _unresolvedHostnames = [];
+            DateTime _lastResolvedOn = DateTime.MinValue;
+
+            #endregion
+
+            #region constructor
+
+            public IpList(IDnsServer dnsServer, Uri listUrl, int resolveIntervalSeconds, NameServerAddress[]? resolveDnsServers)
+                : base(dnsServer, listUrl, false, false, false, true)
+            {
+                _resolveIntervalSeconds = resolveIntervalSeconds;
+                _resolveDnsServers = resolveDnsServers;
+            }
+
+            #endregion
+
+            #region private
+
+            private void ReadIpListFile(out Queue<IPAddress> resolvedIPs, out Queue<string> hostnames)
+            {
+                resolvedIPs = new Queue<IPAddress>();
+                hostnames = new Queue<string>();
+
+                try
+                {
+                    _dnsServer.WriteLog("Advanced Blocking app is reading IP list from: " + _listUrl.AbsoluteUri);
+
+                    using (FileStream fS = new FileStream(_listFilePath, FileMode.Open, FileAccess.Read))
+                    {
+                        using (StreamReader sR = new StreamReader(fS, true))
+                        {
+                            char[] trimSeparator = new char[] { ' ', '\t' };
+                            string? line;
+
+                            while (true)
+                            {
+                                line = sR.ReadLine();
+                                if (line is null)
+                                    break; //eof
+
+                                line = line.Trim(trimSeparator);
+
+                                if (line.Length == 0)
+                                    continue; //skip empty line
+
+                                if (line.StartsWith('#') || line.StartsWith("//"))
+                                    continue; //skip comment line
+
+                                if (IPAddress.TryParse(line, out IPAddress? address))
+                                {
+                                    //normalize IPv4-mapped IPv6 addresses
+                                    if (address.IsIPv4MappedToIPv6)
+                                        address = address.MapToIPv4();
+
+                                    resolvedIPs.Enqueue(address);
+                                }
+                                else if (DnsClient.IsDomainNameValid(line))
+                                {
+                                    hostnames.Enqueue(line.ToLowerInvariant());
+                                }
+                            }
+                        }
+                    }
+
+                    _dnsServer.WriteLog("Advanced Blocking app read IP list file (" + resolvedIPs.Count + " IPs, " + hostnames.Count + " hostnames) from: " + _listUrl.AbsoluteUri);
+                }
+                catch (Exception ex)
+                {
+                    _dnsServer.WriteLog("Advanced Blocking app failed to read IP list from: " + _listUrl.AbsoluteUri + "\r\n" + ex.ToString());
+                }
+            }
+
+            private async Task ResolveHostnamesAsync()
+            {
+                if (_unresolvedHostnames.Count == 0)
+                    return;
+
+                _dnsServer.WriteLog("Advanced Blocking app is resolving " + _unresolvedHostnames.Count + " hostname(s) from IP list: " + _listUrl.AbsoluteUri);
+
+                //start with base IPs (directly parsed from the file) and rebuild resolved set fresh each time
+                HashSet<IPAddress> resolvedIPs = new HashSet<IPAddress>(_baseIPs);
+
+                DnsClient? extDnsClient = null;
+
+                if (_resolveDnsServers is not null && _resolveDnsServers.Length > 0)
+                {
+                    extDnsClient = new DnsClient(_resolveDnsServers);
+                    extDnsClient.Proxy = _dnsServer.Proxy;
+                    extDnsClient.PreferIPv6 = _dnsServer.PreferIPv6;
+                    extDnsClient.Retries = 2;
+                    extDnsClient.Timeout = 4000;
+                }
+
+                foreach (string hostname in _unresolvedHostnames)
+                {
+                    try
+                    {
+                        List<IPAddress> addresses = new List<IPAddress>();
+
+                        if (extDnsClient is not null)
+                        {
+                            DnsDatagram responseA = await extDnsClient.ResolveAsync(new DnsQuestionRecord(hostname, DnsResourceRecordType.A, DnsClass.IN));
+                            addresses.AddRange(DnsClient.ParseResponseA(responseA));
+
+                            DnsDatagram responseAAAA = await extDnsClient.ResolveAsync(new DnsQuestionRecord(hostname, DnsResourceRecordType.AAAA, DnsClass.IN));
+                            addresses.AddRange(DnsClient.ParseResponseAAAA(responseAAAA));
+                        }
+                        else
+                        {
+                            DnsDatagram responseA = await _dnsServer.DirectQueryAsync(new DnsQuestionRecord(hostname, DnsResourceRecordType.A, DnsClass.IN));
+                            addresses.AddRange(DnsClient.ParseResponseA(responseA));
+
+                            DnsDatagram responseAAAA = await _dnsServer.DirectQueryAsync(new DnsQuestionRecord(hostname, DnsResourceRecordType.AAAA, DnsClass.IN));
+                            addresses.AddRange(DnsClient.ParseResponseAAAA(responseAAAA));
+                        }
+
+                        foreach (IPAddress addr in addresses)
+                        {
+                            IPAddress normalized = addr.IsIPv4MappedToIPv6 ? addr.MapToIPv4() : addr;
+                            resolvedIPs.Add(normalized);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _dnsServer.WriteLog("Advanced Blocking app failed to resolve hostname '" + hostname + "' from IP list: " + _listUrl.AbsoluteUri + "\r\n" + ex.ToString());
+                    }
+                }
+
+                _resolvedIPs = resolvedIPs;
+                _lastResolvedOn = DateTime.UtcNow;
+
+                _dnsServer.WriteLog("Advanced Blocking app resolved hostnames for IP list (" + _resolvedIPs.Count + " total IPs): " + _listUrl.AbsoluteUri);
+            }
+
+            #endregion
+
+            #region protected
+
+            protected override void LoadListZone()
+            {
+                ReadIpListFile(out Queue<IPAddress> resolvedIPs, out Queue<string> hostnames);
+
+                HashSet<IPAddress> baseIPSet = new HashSet<IPAddress>(resolvedIPs.Count);
+                while (resolvedIPs.Count > 0)
+                    baseIPSet.Add(resolvedIPs.Dequeue());
+
+                HashSet<string> hostnameSet = new HashSet<string>(hostnames.Count);
+                while (hostnames.Count > 0)
+                    hostnameSet.Add(hostnames.Dequeue());
+
+                _baseIPs = baseIPSet;
+                _resolvedIPs = baseIPSet; //will be expanded by ResolveHostnamesAsync
+                _unresolvedHostnames = hostnameSet;
+            }
+
+            #endregion
+
+            #region public
+
+            public override async Task LoadAsync()
+            {
+                await base.LoadAsync();
+
+                if (_unresolvedHostnames.Count > 0)
+                    await ResolveHostnamesAsync();
+            }
+
+            public override async Task<bool> UpdateAsync()
+            {
+                bool fileChanged = await base.UpdateAsync();
+
+                bool shouldResolve = _unresolvedHostnames.Count > 0 &&
+                    (_resolveIntervalSeconds > 0 && DateTime.UtcNow > _lastResolvedOn.AddSeconds(_resolveIntervalSeconds));
+
+                if (fileChanged)
+                {
+                    //file was re-downloaded; re-resolve hostnames
+                    if (_unresolvedHostnames.Count > 0)
+                        await ResolveHostnamesAsync();
+                }
+                else if (shouldResolve)
+                {
+                    await ResolveHostnamesAsync();
+                }
+
+                return fileChanged;
+            }
+
+            public bool IsIpFound(IPAddress ip)
+            {
+                IPAddress normalized = ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip;
+                return _resolvedIPs.Contains(normalized);
             }
 
             #endregion
