@@ -23,6 +23,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Net.Sockets;
 using System.Threading.Tasks;
 using TechnitiumLibrary.Net;
 using TechnitiumLibrary.Net.Dns;
