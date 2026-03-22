@@ -277,7 +277,7 @@ namespace AdvancedBlockingWithUrlList {
                 return EvaluationResult.None;
             IPAddress clientIp = NormalizeAddress(remoteEP.Address);
             string rawDomain = NormalizeDomain(request.Question[0].Name);
-            string domain = NormalizeQueryDomain(rawDomain);
+            string domain = rawDomain;
             List<string> matchedGroupNames = new List<string>();
             foreach (Group group in _groups) {
                 try {
@@ -385,7 +385,9 @@ namespace AdvancedBlockingWithUrlList {
         }
         private void LoadQueryNameSuffixesToStrip(JsonElement root) {
             _queryNameSuffixesToStrip.Clear();
-            if (!root.TryGetProperty("queryNameSuffixesToStrip", out JsonElement suffixes) || suffixes.ValueKind != JsonValueKind.Array)
+            if (!root.TryGetProperty("defaultBlock", out JsonElement defaultBlock) || defaultBlock.ValueKind != JsonValueKind.Object)
+                return;
+            if (!defaultBlock.TryGetProperty("queryNameSuffixesToStrip", out JsonElement suffixes) || suffixes.ValueKind != JsonValueKind.Array)
                 return;
             HashSet<string> unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (JsonElement item in suffixes.EnumerateArray()) {
