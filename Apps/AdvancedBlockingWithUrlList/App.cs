@@ -1,5 +1,5 @@
 /*
- AdvancedBlockingWithUrlList - TestVersion0.0.01
+ AdvancedBlockingWithUrlList - TestVersion000001
  Supports:
   - ipListMaps (URL -> name)
   - group name auto-linked to ipListMaps name
@@ -563,7 +563,7 @@ namespace AdvancedBlockingWithUrlList
                     }
                     catch (Exception ex)
                     {
-                        _app._dnsServer?.WriteLog("AdvancedBlockingWithUrlList: regex match failed: " + ex.Message);
+                        _app._dns_server?.WriteLog("AdvancedBlockingWithUrlList: regex match failed: " + ex.Message);
                     }
                 }
                 return false;
@@ -676,7 +676,7 @@ namespace AdvancedBlockingWithUrlList
 
                         if (!resp.IsSuccessStatusCode)
                         {
-                            _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Download] HTTP " + (int)resp.StatusCode + " for " + _listUrl.AbsoluteUri);
+                            _dns_server.WriteLog("AdvancedBlockingWithUrlList: [Download] HTTP " + (int)resp.StatusCode + " for " + _listUrl.AbsoluteUri);
                             return false;
                         }
 
@@ -742,10 +742,10 @@ namespace AdvancedBlockingWithUrlList
             HashSet<IPAddress> _resolvedIps = new HashSet<IPAddress>();
             readonly object _lock = new object();
 
-            public int DirectIpCount { get { lock (_lock) return _directIps.Count; } }
-            public int HostnameCount { get { lock (_lock) return _hostnames.Count; } }
-            public int ResolvedIpCount { get { lock (_lock) return _resolved_ips.Count; } }
-            public int TotalIpCount { get { lock (_lock) return _direct_ips.Count + _resolved_ips.Count; } }
+            public int DirectIpCount { get { lock (_lock) { return _directIps.Count; } } }
+            public int HostnameCount { get { lock (_lock) { return _hostnames.Count; } } }
+            public int ResolvedIpCount { get { lock (_lock) { return _resolvedIps.Count; } } }
+            public int TotalIpCount { get { lock (_lock) { return _directIps.Count + _resolvedIps.Count; } } }
 
             public IpList(IDnsServer dnsServer, Uri listUrl, int httpTimeoutSeconds, IPAddress[]? resolveDnsServers)
                 : base(dnsServer, listUrl, httpTimeoutSeconds)
@@ -799,7 +799,7 @@ namespace AdvancedBlockingWithUrlList
                 {
                     _directIps = ips;
                     _hostnames = hosts;
-                    _resolved_ips = new HashSet<IPAddress>();
+                    _resolvedIps = new HashSet<IPAddress>();
                 }
 
                 _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Parse] " + _listUrl.AbsoluteUri
@@ -851,7 +851,7 @@ namespace AdvancedBlockingWithUrlList
                 // replace resolved IPs (fresh)
                 lock (_lock)
                 {
-                    _resolved_ips = newResolved;
+                    _resolvedIps = newResolved;
                 }
 
                 _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Resolve] " + _listUrl.AbsoluteUri
@@ -875,7 +875,7 @@ namespace AdvancedBlockingWithUrlList
                             var aResp = await client.ResolveAsync(new DnsQuestionRecord(host, DnsResourceRecordType.A, DnsClass.IN));
                             foreach (var a in DnsClient.ParseResponseA(aResp))
                             {
-                                lock (results) results.Add(a);
+                                lock (results) { results.Add(a); }
                                 _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Resolve] " + host + " -> " + a);
                             }
                         }
@@ -893,7 +893,7 @@ namespace AdvancedBlockingWithUrlList
                             var aResp = await _dnsServer.DirectQueryAsync(new DnsQuestionRecord(host, DnsResourceRecordType.A, DnsClass.IN), resolveTimeoutMs);
                             foreach (var a in DnsClient.ParseResponseA(aResp))
                             {
-                                lock (results) results.Add(a);
+                                lock (results) { results.Add(a); }
                                 _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Resolve] " + host + " -> " + a);
                             }
                         }
@@ -913,7 +913,7 @@ namespace AdvancedBlockingWithUrlList
             {
                 lock (_lock)
                 {
-                    return _directIps.Contains(ip) || _resolved_ips.Contains(ip);
+                    return _directIps.Contains(ip) || _resolvedIps.Contains(ip);
                 }
             }
         }
