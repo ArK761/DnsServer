@@ -1,5 +1,5 @@
 /*
- AdvancedBlockingWithUrlList - TestVersion0012
+ AdvancedBlockingWithUrlList - TestVersion00000000054
  Supports:
   - ipListMaps (URL -> name)
   - group name auto-linked to ipListMaps name
@@ -296,6 +296,10 @@ namespace AdvancedBlockingWithUrlList {
             }
             if (matchedGroupNames.Count == 0)
                 return EvaluationResult.None;
+            if (ShouldSkipDefaultBlock(domain)) {
+                Log("SKIP default-block for domain='" + domain + "' client='" + clientIp + "' groups='" + string.Join(",", matchedGroupNames) + "'");
+                return EvaluationResult.None;
+            }
             blockingGroup = FindFirstMatchedGroup(clientIp);
             blockingReport = "source=advanced-blocking-with-url-list; action=default-block; client=" + clientIp + "; domain=" + domain + "; groups=" + string.Join(",", matchedGroupNames);
             Log("BLOCK client='" + clientIp + "' domain='" + domain + "' groups='" + string.Join(",", matchedGroupNames) + "'");
@@ -307,6 +311,12 @@ namespace AdvancedBlockingWithUrlList {
                     return group;
             }
             return null;
+        }
+        private static bool ShouldSkipDefaultBlock(string domain) {
+            if (string.IsNullOrWhiteSpace(domain))
+                return false;
+            string normalized = NormalizeDomain(domain);
+            return normalized.Equals("local", StringComparison.OrdinalIgnoreCase) || normalized.EndsWith(".local", StringComparison.OrdinalIgnoreCase);
         }
         private DnsDatagram CreateBlockedResponse(DnsDatagram request, Group? group, string? blockingReport) {
             DnsQuestionRecord question = request.Question[0];
