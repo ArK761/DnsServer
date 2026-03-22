@@ -319,30 +319,6 @@ namespace AdvancedBlockingWithUrlList {
                 };
                 return new DnsDatagram(request.Identifier, true, DnsOpcode.StandardQuery, false, false, request.RecursionDesired, false, false, false, DnsResponseCode.NoError, request.Question, txtAnswer);
             }
-            if (_defaultBlock.BlockAsNxDomain) {
-                string parentDomain = GetParentZone(question.Name) ?? string.Empty;
-                IReadOnlyList<DnsResourceRecord> authority = new DnsResourceRecord[] {
-                    new DnsResourceRecord(parentDomain, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
-                };
-                return new DnsDatagram(
-                    request.Identifier,
-                    true,
-                    DnsOpcode.StandardQuery,
-                    false,
-                    false,
-                    request.RecursionDesired,
-                    false,
-                    false,
-                    false,
-                    DnsResponseCode.NxDomain,
-                    request.Question,
-                    null,
-                    authority,
-                    null,
-                    request.EDNS is null ? ushort.MinValue : _dnsServer!.UdpPayloadSize,
-                    EDnsHeaderFlags.None,
-                    null);
-            }
             IReadOnlyList<DnsResourceRecord>? answer = null;
             IReadOnlyList<DnsResourceRecord>? authorityNoError = null;
             switch (question.Type) {
@@ -873,7 +849,7 @@ namespace AdvancedBlockingWithUrlList {
                         }
                     }
                 }
-                if (aRecords.Count == 0 && aaaaRecords.Count == 0 && !blockAsNxDomain)
+                if (aRecords.Count == 0 && aaaaRecords.Count == 0)
                     aRecords.Add(new DnsARecordData(IPAddress.Loopback));
                 string nsDomain = dnsServer.ServerDomain ?? "blocked.local";
                 DnsNSRecordData nsRecord = new DnsNSRecordData(nsDomain);
