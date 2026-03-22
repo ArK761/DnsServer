@@ -1,5 +1,5 @@
 /*
- AdvancedBlockingWithUrlList - TestVersion_01
+ AdvancedBlockingWithUrlList - TestVersion0.0.01
  Supports:
   - ipListMaps (URL -> name)
   - group name auto-linked to ipListMaps name
@@ -348,7 +348,7 @@ namespace AdvancedBlockingWithUrlList
                 return Task.FromResult<DnsDatagram?>(null);
 
             // guard against malformed requests
-            if (request == null || request.Question == null || request.Question.Length == 0)
+            if (request == null || request.Question == null || request.Question.Count == 0)
             {
                 _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: empty or invalid question in request");
                 return Task.FromResult<DnsDatagram?>(null);
@@ -744,8 +744,8 @@ namespace AdvancedBlockingWithUrlList
 
             public int DirectIpCount { get { lock (_lock) return _directIps.Count; } }
             public int HostnameCount { get { lock (_lock) return _hostnames.Count; } }
-            public int ResolvedIpCount { get { lock (_lock) return _resolvedIps.Count; } }
-            public int TotalIpCount { get { lock (_lock) return _directIps.Count + _resolvedIps.Count; } }
+            public int ResolvedIpCount { get { lock (_lock) return _resolved_ips.Count; } }
+            public int TotalIpCount { get { lock (_lock) return _direct_ips.Count + _resolved_ips.Count; } }
 
             public IpList(IDnsServer dnsServer, Uri listUrl, int httpTimeoutSeconds, IPAddress[]? resolveDnsServers)
                 : base(dnsServer, listUrl, httpTimeoutSeconds)
@@ -799,7 +799,7 @@ namespace AdvancedBlockingWithUrlList
                 {
                     _directIps = ips;
                     _hostnames = hosts;
-                    _resolvedIps = new HashSet<IPAddress>();
+                    _resolved_ips = new HashSet<IPAddress>();
                 }
 
                 _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Parse] " + _listUrl.AbsoluteUri
@@ -851,7 +851,7 @@ namespace AdvancedBlockingWithUrlList
                 // replace resolved IPs (fresh)
                 lock (_lock)
                 {
-                    _resolvedIps = newResolved;
+                    _resolved_ips = newResolved;
                 }
 
                 _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Resolve] " + _listUrl.AbsoluteUri
@@ -913,7 +913,7 @@ namespace AdvancedBlockingWithUrlList
             {
                 lock (_lock)
                 {
-                    return _directIps.Contains(ip) || _resolvedIps.Contains(ip);
+                    return _directIps.Contains(ip) || _resolved_ips.Contains(ip);
                 }
             }
         }
