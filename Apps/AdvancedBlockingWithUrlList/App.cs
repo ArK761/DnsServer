@@ -563,7 +563,7 @@ namespace AdvancedBlockingWithUrlList
                     }
                     catch (Exception ex)
                     {
-                        _app._dns_server?.WriteLog("AdvancedBlockingWithUrlList: regex match failed: " + ex.Message);
+                        _app._dnsServer?.WriteLog("AdvancedBlockingWithUrlList: regex match failed: " + ex.Message);
                     }
                 }
                 return false;
@@ -676,7 +676,7 @@ namespace AdvancedBlockingWithUrlList
 
                         if (!resp.IsSuccessStatusCode)
                         {
-                            _dns_server.WriteLog("AdvancedBlockingWithUrlList: [Download] HTTP " + (int)resp.StatusCode + " for " + _listUrl.AbsoluteUri);
+                            _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Download] HTTP " + (int)resp.StatusCode + " for " + _listUrl.AbsoluteUri);
                             return false;
                         }
 
