@@ -1,5 +1,5 @@
 /*
- AdvancedBlockingWithUrlList - TestVersion00000000054
+ AdvancedBlockingWithUrlList - TestVersion1001
  Supports:
   - ipListMaps (URL -> name)
   - group name auto-linked to ipListMaps name
@@ -31,7 +31,6 @@ namespace AdvancedBlockingWithUrlList {
     public sealed class App : IDnsApplication, IDnsRequestBlockingHandler, IDisposable {
         private static readonly HttpClient s_httpClient = new HttpClient();
         private IDnsServer? _dnsServer;
-        private bool _enableBlocking = true;
         private uint _blockingAnswerTtl = 30;
         private int _downloadIntervalMinutes = 5;
         private int _downloadSleepSeconds = 30;
@@ -60,7 +59,6 @@ namespace AdvancedBlockingWithUrlList {
                 CommentHandling = JsonCommentHandling.Skip
             });
             JsonElement root = doc.RootElement;
-            _enableBlocking = root.GetPropertyValue("enableBlocking", true);
             _blockingAnswerTtl = root.GetPropertyValue("blockingAnswerTtl", 30u);
             _downloadIntervalMinutes = Math.Max(1, root.GetPropertyValue("blockListUrlUpdateIntervalMinutes", 5));
             _downloadSleepSeconds = Math.Max(0, root.GetPropertyValue("blockListUrlUpdateSleepSeconds", 30));
@@ -75,17 +73,13 @@ namespace AdvancedBlockingWithUrlList {
             _cts = new CancellationTokenSource();
             _downloadLoopTask = Task.Run(() => DownloadLoopAsync(_cts.Token));
             _resolveLoopTask = Task.Run(() => ResolveLoopAsync(_cts.Token));
-            Log("Initialized. enableBlocking=" + _enableBlocking + ", groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count);
+            Log("Initialized. groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count);
         }
         public Task<bool> IsAllowedAsync(DnsDatagram request, IPEndPoint remoteEP) {
-            if (!_enableBlocking)
-                return Task.FromResult(false);
             EvaluationResult result = EvaluateRequest(request, remoteEP, out _, out _);
             return Task.FromResult(result == EvaluationResult.Allow);
         }
         public Task<DnsDatagram?> ProcessRequestAsync(DnsDatagram request, IPEndPoint remoteEP) {
-            if (!_enableBlocking)
-                return Task.FromResult<DnsDatagram?>(null);
             EvaluationResult result = EvaluateRequest(request, remoteEP, out Group? group, out string? report);
             if (result != EvaluationResult.Block)
                 return Task.FromResult<DnsDatagram?>(null);
@@ -296,10 +290,6 @@ namespace AdvancedBlockingWithUrlList {
             }
             if (matchedGroupNames.Count == 0)
                 return EvaluationResult.None;
-            if (ShouldSkipDefaultBlock(domain)) {
-                Log("SKIP default-block for domain='" + domain + "' client='" + clientIp + "' groups='" + string.Join(",", matchedGroupNames) + "'");
-                return EvaluationResult.None;
-            }
             blockingGroup = FindFirstMatchedGroup(clientIp);
             blockingReport = "source=advanced-blocking-with-url-list; action=default-block; client=" + clientIp + "; domain=" + domain + "; groups=" + string.Join(",", matchedGroupNames);
             Log("BLOCK client='" + clientIp + "' domain='" + domain + "' groups='" + string.Join(",", matchedGroupNames) + "'");
@@ -311,12 +301,6 @@ namespace AdvancedBlockingWithUrlList {
                     return group;
             }
             return null;
-        }
-        private static bool ShouldSkipDefaultBlock(string domain) {
-            if (string.IsNullOrWhiteSpace(domain))
-                return false;
-            string normalized = NormalizeDomain(domain);
-            return normalized.Equals("local", StringComparison.OrdinalIgnoreCase) || normalized.EndsWith(".local", StringComparison.OrdinalIgnoreCase);
         }
         private DnsDatagram CreateBlockedResponse(DnsDatagram request, Group? group, string? blockingReport) {
             DnsQuestionRecord question = request.Question[0];
