@@ -42,8 +42,10 @@ namespace AdvancedBlockingWithUrlList
         Dictionary<Uri, IpList> _allIpListZones = new Dictionary<Uri, IpList>(UriComparer.Instance);
         Dictionary<string, Uri> _nameToUrlMap = new Dictionary<string, Uri>(StringComparer.OrdinalIgnoreCase);
 
-        Timer? _downloadTimer;
-        Timer? _resolveTimer;
+        // background workers
+        CancellationTokenSource? _cts;
+        Task? _downloadTask;
+        Task? _resolveTask;
 
         int _downloadIntervalMinutes = 5;
         int _downloadSleepSeconds = 30;
@@ -51,12 +53,32 @@ namespace AdvancedBlockingWithUrlList
         int _httpTimeoutSeconds = 30;
         IPAddress[]? _globalResolveDnsServers;
 
+        // Shared HttpClient to avoid socket exhaustion
+        static readonly HttpClient s_httpClient = new HttpClient();
+
         public void Dispose()
         {
-            _downloadTimer?.Dispose();
-            _downloadTimer = null;
-            _resolveTimer?.Dispose();
-            _resolveTimer = null;
+            try
+            {
+                _cts?.Cancel();
+
+                if (_downloadTask != null)
+                {
+                    try { _downloadTask.Wait(TimeSpan.FromSeconds(5)); } catch { }
+                    _downloadTask = null;
+                }
+
+                if (_resolveTask != null)
+                {
+                    try { _resolveTask.Wait(TimeSpan.FromSeconds(5)); } catch { }
+                    _resolveTask = null;
+                }
+            }
+            finally
+            {
+                _cts?.Dispose();
+                _cts = null;
+            }
         }
 
         public string Description => "AdvancedBlockingWithUrlList: URL-based IP lists with separate download/resolve timers, batch resolve max 10, IPv4 only.\n";
@@ -65,10 +87,13 @@ namespace AdvancedBlockingWithUrlList
         {
             _dnsServer = dnsServer;
 
-            _downloadTimer?.Dispose();
-            _downloadTimer = null;
-            _resolveTimer?.Dispose();
-            _resolveTimer = null;
+            // cancel previous workers if any
+            _cts?.Cancel();
+            if (_downloadTask != null) { try { _downloadTask.Wait(TimeSpan.FromSeconds(5)); } catch { } _downloadTask = null; }
+            if (_resolveTask != null) { try { _resolveTask.Wait(TimeSpan.FromSeconds(5)); } catch { } _resolveTask = null; }
+            _cts?.Dispose();
+            _cts = new CancellationTokenSource();
+
             _allIpListZones = new Dictionary<Uri, IpList>(UriComparer.Instance);
             _nameToUrlMap = new Dictionary<string, Uri>(StringComparer.OrdinalIgnoreCase);
             _groups = null;
@@ -176,37 +201,71 @@ namespace AdvancedBlockingWithUrlList
 
             _dnsServer.WriteLog("AdvancedBlockingWithUrlList: Init complete. Groups=" + (_groups?.Count ?? 0) + " IpLists=" + _allIpListZones.Count);
 
-            // TIMER 1: Download — check URLs for changes
-            var downloadDue = TimeSpan.FromMinutes(_downloadIntervalMinutes);
-            _downloadTimer = new Timer(async _ =>
-            {
-                try
-                {
-                    _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Download] Starting...");
-                    await DownloadAllListsAsync();
-                    _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Download] Done.");
-                }
-                catch (Exception ex)
-                {
-                    _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Download] Error: " + ex.Message);
-                }
-            }, null, downloadDue, downloadDue);
+            // start background workers
+            var ct = _cts.Token;
+            _downloadTask = Task.Run(() => DownloadLoopAsync(ct), ct);
+            _resolveTask = Task.Run(() => ResolveLoopAsync(ct), ct);
+        }
 
-            // TIMER 2: Resolve — re-nslookup FQDN hostnames (IPv4 only, batch 10)
-            var resolveDue = TimeSpan.FromSeconds(_resolveIntervalSeconds);
-            _resolveTimer = new Timer(async _ =>
+        async Task DownloadLoopAsync(CancellationToken cancellationToken)
+        {
+            try
             {
-                try
+                // initial delay equals configured interval to match previous timer semantics
+                var delay = TimeSpan.FromMinutes(_downloadIntervalMinutes);
+                await Task.Delay(delay, cancellationToken);
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Resolve] Starting...");
-                    await ResolveAllListsAsync();
-                    _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Resolve] Done.");
+                    try
+                    {
+                        _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Download] Starting...");
+                        await DownloadAllListsAsync();
+                        _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Download] Done.");
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Download] Error: " + ex.Message);
+                    }
+
+                    await Task.Delay(TimeSpan.FromMinutes(_downloadIntervalMinutes), cancellationToken);
                 }
-                catch (Exception ex)
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                try { _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [DownloadLoop] Fatal: " + ex.Message); } catch { }
+            }
+        }
+
+        async Task ResolveLoopAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var delay = TimeSpan.FromSeconds(_resolveIntervalSeconds);
+                await Task.Delay(delay, cancellationToken);
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Resolve] Error: " + ex.Message);
+                    try
+                    {
+                        _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Resolve] Starting...");
+                        await ResolveAllListsAsync();
+                        _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Resolve] Done.");
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [Resolve] Error: " + ex.Message);
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(_resolveIntervalSeconds), cancellationToken);
                 }
-            }, null, resolveDue, resolveDue);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                try { _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: [ResolveLoop] Fatal: " + ex.Message); } catch { }
+            }
         }
 
         async Task DownloadAllListsAsync()
@@ -271,7 +330,10 @@ namespace AdvancedBlockingWithUrlList
                                 return Task.FromResult(false);
                         }
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: IsAllowed check failed: " + ex.Message);
+                    }
                 }
             }
 
@@ -280,9 +342,17 @@ namespace AdvancedBlockingWithUrlList
 
         public Task<DnsDatagram?> ProcessRequestAsync(DnsDatagram request, IPEndPoint remoteEP)
         {
-    _dnsServer.WriteLog("ABWL: ProcessRequestAsync called from " + remoteEP.Address);
+            _dnsServer?.WriteLog("ABWL: ProcessRequestAsync called from " + remoteEP.Address);
+
             if (!_enableBlocking)
                 return Task.FromResult<DnsDatagram?>(null);
+
+            // guard against malformed requests
+            if (request == null || request.Question == null || request.Question.Length == 0)
+            {
+                _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: empty or invalid question in request");
+                return Task.FromResult<DnsDatagram?>(null);
+            }
 
             if (_groups is not null)
             {
@@ -291,13 +361,14 @@ namespace AdvancedBlockingWithUrlList
                     var g = kv.Value;
                     if (!g.EnableBlocking) continue;
 
-IPAddress clientIp = remoteEP.Address;
+                    IPAddress clientIp = remoteEP.Address;
 
-if (clientIp.AddressFamily == AddressFamily.InterNetworkV6 && clientIp.IsIPv4MappedToIPv6)
-    clientIp = clientIp.MapToIPv4();
+                    if (clientIp.AddressFamily == AddressFamily.InterNetworkV6 && clientIp.IsIPv4MappedToIPv6)
+                        clientIp = clientIp.MapToIPv4();
 
-if (!g.IsClientInIpLists(clientIp))
-    continue;
+                    if (!g.IsClientInIpLists(clientIp))
+                        continue;
+
                     DnsQuestionRecord q = request.Question[0];
 
                     if (g.IsZoneBlocked(q.Name))
@@ -313,9 +384,43 @@ if (!g.IsClientInIpLists(clientIp))
 
         DnsDatagram CreateBlockedResponse(DnsDatagram request, DnsQuestionRecord q)
         {
-            var soa = new DnsSOARecordData(_dnsServer!.ServerDomain, _dnsServer.ResponsiblePerson.Address, 1, 3600, 600, 86400, _blockingAnswerTtl);
-            var auth = new DnsResourceRecord[] { new DnsResourceRecord(q.Name, DnsResourceRecordType.SOA, q.Class, _blockingAnswerTtl, soa) };
-            return new DnsDatagram(request.Identifier, true, DnsOpcode.StandardQuery, false, false, request.RecursionDesired, false, false, false, DnsResponseCode.NxDomain, request.Question, null, auth);
+            // Default: return NXDOMAIN with SOA in authority (consistent with other blocking apps)
+            try
+            {
+                var soa = new DnsSOARecordData(_dnsServer!.ServerDomain, _dnsServer.ResponsiblePerson.Address, 1, 3600, 600, 86400, _blockingAnswerTtl);
+                var authority = new DnsResourceRecord[] { new DnsResourceRecord(q.Name, DnsResourceRecordType.SOA, q.Class, _blockingAnswerTtl, soa) };
+
+                return new DnsDatagram(
+                    ID: request.Identifier,
+                    isResponse: true,
+                    OPCODE: DnsOpcode.StandardQuery,
+                    authoritativeAnswer: true,
+                    truncation: false,
+                    recursionDesired: request.RecursionDesired,
+                    recursionAvailable: _dnsServer != null, // best-effort
+                    authenticData: false,
+                    checkingDisabled: false,
+                    RCODE: DnsResponseCode.NxDomain,
+                    question: request.Question,
+                    answer: null,
+                    authority: authority,
+                    additional: null,
+                    udpPayloadSize: request.EDNS is null ? ushort.MinValue : _dnsServer!.UdpPayloadSize,
+                    ednsFlags: EDnsHeaderFlags.None,
+                    options: null
+                );
+            }
+            catch (Exception ex)
+            {
+                // fallback: return simple NXDOMAIN minimal datagram
+                try
+                {
+                    _dnsServer?.WriteLog("AdvancedBlockingWithUrlList: CreateBlockedResponse failed: " + ex.Message);
+                }
+                catch { }
+
+                return new DnsDatagram(request.Identifier, true, DnsOpcode.StandardQuery, true, false, request.RecursionDesired, false, false, false, DnsResponseCode.NxDomain, request.Question, null);
+            }
         }
 
         // ---------- Helper / nested types ----------
@@ -324,7 +429,7 @@ if (!g.IsClientInIpLists(clientIp))
         {
             public static readonly UriComparer Instance = new UriComparer();
             public bool Equals(Uri? x, Uri? y) => StringComparer.OrdinalIgnoreCase.Equals(x?.AbsoluteUri, y?.AbsoluteUri);
-            public int GetHashCode(Uri obj) => StringComparer.OrdinalIgnoreCase.GetHashCode(obj.AbsoluteUri);
+            public int GetHashCode(Uri obj) => obj is null ? 0 : StringComparer.OrdinalIgnoreCase.GetHashCode(obj.AbsoluteUri);
         }
 
         class Group
@@ -387,7 +492,10 @@ if (!g.IsClientInIpLists(clientIp))
                                     System.Text.RegularExpressions.RegexOptions.Compiled |
                                     System.Text.RegularExpressions.RegexOptions.Singleline));
                             }
-                            catch { }
+                            catch (Exception ex)
+                            {
+                                _app._dnsServer?.WriteLog("AdvancedBlockingWithUrlList: Invalid regex '" + pattern + "': " + ex.Message);
+                            }
                         }
                     }
                 }
@@ -428,7 +536,10 @@ if (!g.IsClientInIpLists(clientIp))
                         if (kv.Value.IsIpFound(ip))
                             return true;
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        _app._dnsServer?.WriteLog("AdvancedBlockingWithUrlList: IsClientInIpLists error: " + ex.Message);
+                    }
                 }
                 return false;
             }
@@ -450,7 +561,10 @@ if (!g.IsClientInIpLists(clientIp))
                         if (rx.IsMatch(domain))
                             return true;
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        _app._dnsServer?.WriteLog("AdvancedBlockingWithUrlList: regex match failed: " + ex.Message);
+                    }
                 }
                 return false;
             }
@@ -547,13 +661,15 @@ if (!g.IsClientInIpLists(clientIp))
                     }
                     else
                     {
-                        using HttpClient http = new HttpClient();
-                        http.Timeout = TimeSpan.FromSeconds(_httpTimeoutSeconds);
-
+                        using var req = new HttpRequestMessage(HttpMethod.Get, _listUrl);
                         if (File.Exists(_cachePath) && LastModified > DateTime.MinValue)
-                            http.DefaultRequestHeaders.IfModifiedSince = new DateTimeOffset(LastModified);
+                        {
+                            var dto = new DateTimeOffset(DateTime.SpecifyKind(LastModified, DateTimeKind.Utc));
+                            req.Headers.IfModifiedSince = dto;
+                        }
 
-                        using var resp = await http.GetAsync(_listUrl);
+                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_httpTimeoutSeconds));
+                        var resp = await s_httpClient.SendAsync(req, cts.Token);
 
                         if (resp.StatusCode == HttpStatusCode.NotModified)
                             return false;
@@ -587,6 +703,11 @@ if (!g.IsClientInIpLists(clientIp))
                         return true;
                     }
                 }
+                catch (OperationCanceledException)
+                {
+                    _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Download] Timed out: " + _listUrl.AbsoluteUri);
+                    return false;
+                }
                 catch (Exception ex)
                 {
                     try { _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Download] Failed: " + _listUrl + " => " + ex.Message); } catch { }
@@ -597,7 +718,7 @@ if (!g.IsClientInIpLists(clientIp))
             protected IEnumerable<string> ReadListLines()
             {
                 if (!File.Exists(_cachePath)) yield break;
-                using var sr = new StreamReader(_cachePath);
+                using var sr = new StreamReader(_cachePath, Encoding.UTF8);
                 string? line;
                 while ((line = sr.ReadLine()) != null)
                 {
@@ -644,7 +765,7 @@ if (!g.IsClientInIpLists(clientIp))
                 {
                     if (_directIps.Count == 0 && _hostnames.Count == 0 && File.Exists(_cachePath))
                     {
-                        // first run, cache exists but not yet parsed
+                        // first run, cache exists but not yet parsed -> parse and treat as change
                     }
                     else
                     {
@@ -721,7 +842,7 @@ if (!g.IsClientInIpLists(clientIp))
                     }
 
                     // wait for entire batch to finish before starting next
-                    try { await Task.WhenAll(batchTasks); } catch { }
+                    try { await Task.WhenAll(batchTasks); } catch (Exception ex) { _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Resolve] Batch error: " + ex.Message); }
 
                     _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Resolve] Batch " + batchNum
                         + " done (" + count + " hosts), resolved so far: " + newResolved.Count + " IPs");
@@ -767,7 +888,9 @@ if (!g.IsClientInIpLists(clientIp))
                     {
                         try
                         {
-                            var aResp = await _dnsServer.DirectQueryAsync(new DnsQuestionRecord(host, DnsResourceRecordType.A, DnsClass.IN), 5000);
+                            // use direct query from dns server with a reasonable timeout derived from http timeout
+                            int resolveTimeoutMs = Math.Max(5000, _httpTimeoutSeconds * 1000);
+                            var aResp = await _dnsServer.DirectQueryAsync(new DnsQuestionRecord(host, DnsResourceRecordType.A, DnsClass.IN), resolveTimeoutMs);
                             foreach (var a in DnsClient.ParseResponseA(aResp))
                             {
                                 lock (results) results.Add(a);
