@@ -1,5 +1,5 @@
 /*
- AdvancedBlockingWithUrlList - TestVersion000002
+ AdvancedBlockingWithUrlList - TestVersion000001
  Supports:
   - ipListMaps (URL -> name)
   - group name auto-linked to ipListMaps name
@@ -791,7 +791,8 @@ namespace AdvancedBlockingWithUrlList
             }
             void LoadResolvedFileIntoMemory()
             {
-                var resolved = new HashSet<IPAddress>();
+                var resolvedFromFile = new HashSet<IPAddress>();
+                HashSet<IPAddress> directSnapshot;
                 try
                 {
                     if (File.Exists(_resolvedPath))
@@ -800,7 +801,7 @@ namespace AdvancedBlockingWithUrlList
                         {
                             string value = line.Trim();
                             if (IPAddress.TryParse(value, out IPAddress? ip))
-                                resolved.Add(NormalizeIp(ip));
+                                resolvedFromFile.Add(NormalizeIp(ip));
                         }
                     }
                 }
@@ -810,15 +811,22 @@ namespace AdvancedBlockingWithUrlList
                 }
                 lock (_lock)
                 {
-                    _resolvedIps = resolved;
+                    directSnapshot = new HashSet<IPAddress>(_directIps);
+                }
+                resolvedFromFile.ExceptWith(directSnapshot);
+                lock (_lock)
+                {
+                    _resolvedIps = resolvedFromFile;
                 }
             }
             public async Task ResolveHostnamesAsync()
             {
                 string[] hosts;
+                IPAddress[] directIps;
                 lock (_lock)
                 {
                     hosts = _hostnames.ToArray();
+                    directIps = _directIps.ToArray();
                 }
                 if (hosts.Length == 0)
                 {
@@ -826,13 +834,18 @@ namespace AdvancedBlockingWithUrlList
                     {
                         _resolvedIps = new HashSet<IPAddress>();
                     }
-                    await WriteResolvedFileAsync(Array.Empty<IPAddress>()).ConfigureAwait(false);
-                    _dnsServer.WriteLog("AdvancedBlockingWithUrlList: [Resolve] " + DisplayName + " no hostnames. Cleared " + ResolveFileName);
+                    await WriteResolvedFileAsync(directIps, Array.Empty<IPAddress>()).ConfigureAwait(false);
+                    _dnsServer.WriteLog(
+                        "AdvancedBlockingWithUrlList: [Resolve] " + DisplayName +
+                        " no hostnames. Wrote directIPs=" + directIps.Length +
+                        " into " + ResolveFileName
+                    );
                     return;
                 }
                 _dnsServer.WriteLog(
                     "AdvancedBlockingWithUrlList: [Resolve] " + DisplayName +
-                    " resolving " + hosts.Length + " hostnames into " + ResolveFileName
+                    " resolving " + hosts.Length + " hostnames into " + ResolveFileName +
+                    " with directIPs=" + directIps.Length
                 );
                 var newResolved = new HashSet<IPAddress>();
                 int batchNum = 0;
@@ -865,7 +878,7 @@ namespace AdvancedBlockingWithUrlList
                 {
                     _resolvedIps = newResolved;
                 }
-                await WriteResolvedFileAsync(newResolved).ConfigureAwait(false);
+                await WriteResolvedFileAsync(directIps, newResolved).ConfigureAwait(false);
                 _dnsServer.WriteLog(
                     "AdvancedBlockingWithUrlList: [Resolve] " + DisplayName +
                     " complete. directIPs=" + DirectIpCount +
@@ -874,11 +887,12 @@ namespace AdvancedBlockingWithUrlList
                     " resolveFile=" + ResolveFileName
                 );
             }
-            async Task WriteResolvedFileAsync(IEnumerable<IPAddress> addresses)
+            async Task WriteResolvedFileAsync(IEnumerable<IPAddress> directAddresses, IEnumerable<IPAddress> resolvedAddresses)
             {
                 try
                 {
-                    string[] lines = addresses
+                    string[] lines = directAddresses
+                        .Concat(resolvedAddresses)
                         .Select(NormalizeIp)
                         .Distinct()
                         .OrderBy(x => x.ToString(), StringComparer.OrdinalIgnoreCase)
