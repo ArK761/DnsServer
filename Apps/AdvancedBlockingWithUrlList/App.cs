@@ -1,5 +1,5 @@
 /*
- AdvancedBlockingWithUrlList - TestVersion001
+ AdvancedBlockingWithUrlList - TestVersion0012
  Supports:
   - ipListMaps (URL -> name)
   - group name auto-linked to ipListMaps name
@@ -317,12 +317,6 @@ namespace AdvancedBlockingWithUrlList {
                 };
                 return new DnsDatagram(request.Identifier, true, DnsOpcode.StandardQuery, false, false, request.RecursionDesired, false, false, false, DnsResponseCode.NoError, request.Question, txtAnswer);
             }
-            EDnsOption[]? options = null;
-            if (_defaultBlock.AllowTxtBlockingReport && request.EDNS is not null && !string.IsNullOrWhiteSpace(blockingReport)) {
-                options = new EDnsOption[] {
-                    new EDnsOption(EDnsOptionCode.EXTENDED_DNS_ERROR, new EDnsExtendedDnsErrorOptionData(EDnsExtendedDnsErrorCode.Blocked, blockingReport))
-                };
-            }
             if (_defaultBlock.BlockAsNxDomain) {
                 string parentDomain = GetParentZone(question.Name) ?? string.Empty;
                 IReadOnlyList<DnsResourceRecord> authority = new DnsResourceRecord[] {
@@ -345,7 +339,7 @@ namespace AdvancedBlockingWithUrlList {
                     null,
                     request.EDNS is null ? ushort.MinValue : _dnsServer!.UdpPayloadSize,
                     EDnsHeaderFlags.None,
-                    options);
+                    null);
             }
             IReadOnlyList<DnsResourceRecord>? answer = null;
             IReadOnlyList<DnsResourceRecord>? authorityNoError = null;
@@ -411,7 +405,7 @@ namespace AdvancedBlockingWithUrlList {
                 null,
                 request.EDNS is null ? ushort.MinValue : _dnsServer!.UdpPayloadSize,
                 EDnsHeaderFlags.None,
-                options);
+                null);
         }
         private static IPAddress[]? ParseDnsServers(JsonElement element, string propertyName) {
             if (!element.TryGetProperty(propertyName, out JsonElement servers) || servers.ValueKind != JsonValueKind.Array)
