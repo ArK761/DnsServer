@@ -42,11 +42,11 @@ namespace AdvancedBlockingWithUrlList {
         private readonly Dictionary<string, AllowList> _allowListsByUrl = new Dictionary<string, AllowList>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, RegexAllowList> _regexAllowListsByUrl = new Dictionary<string, RegexAllowList>(StringComparer.OrdinalIgnoreCase);
         private readonly List<Group> _groups = new List<Group>();
-        private readonly HashSet<string> _knownClientDnsSuffixes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> _queryNameSuffixesToStrip = new List<string>();
         private CancellationTokenSource? _cts;
         private Task? _downloadLoopTask;
         private Task? _resolveLoopTask;
-        public string Description => "AdvancedBlockingWithUrlList: ordered allow rules per group, with global default block for matched clients.";
+        public string Description => "AdvancedBlockingWithUrlList: ordered allow rules per group, with global default block for matched clients and optional query suffix stripping.";
         public void Dispose() {
             StopWorkers();
         }
@@ -66,16 +66,16 @@ namespace AdvancedBlockingWithUrlList {
             _httpTimeoutSeconds = Math.Max(5, root.GetPropertyValue("httpTimeoutSeconds", 30));
             _resolveIntervalSeconds = Math.Max(300, root.GetPropertyValue("ipListResolveIntervalSeconds", 300));
             _resolveDnsServers = ParseDnsServers(root, "ipListResolveDnsServers");
+            LoadQueryNameSuffixesToStrip(root);
             _defaultBlock = DefaultBlockSettings.FromJson(root.TryGetProperty("defaultBlock", out JsonElement defaultBlock) ? defaultBlock : default, dnsServer);
             LoadIpLists(root);
             LoadGroups(root);
             LinkSharedAllowLists();
-            RebuildKnownClientDnsSuffixes();
-            await InitialLoadAsync().ConfigureAwait(false);
+                        await InitialLoadAsync().ConfigureAwait(false);
             _cts = new CancellationTokenSource();
             _downloadLoopTask = Task.Run(() => DownloadLoopAsync(_cts.Token));
             _resolveLoopTask = Task.Run(() => ResolveLoopAsync(_cts.Token));
-            Log("Initialized. groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count);
+            Log("Initialized. groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count + ", queryNameSuffixesToStrip=" + (_queryNameSuffixesToStrip.Count == 0 ? "<none>" : string.Join(",", _queryNameSuffixesToStrip)));
         }
         public Task<bool> IsAllowedAsync(DnsDatagram request, IPEndPoint remoteEP) {
             EvaluationResult result = EvaluateRequest(request, remoteEP, out _, out _);
@@ -92,7 +92,7 @@ namespace AdvancedBlockingWithUrlList {
             _allowListsByUrl.Clear();
             _regexAllowListsByUrl.Clear();
             _groups.Clear();
-            _knownClientDnsSuffixes.Clear();
+            _queryNameSuffixesToStrip.Clear();
         }
         private void StopWorkers() {
             try {
@@ -173,8 +173,7 @@ namespace AdvancedBlockingWithUrlList {
                     Log("Initial IP list load failed for '" + ipList.LogicalName + "': " + ex.Message);
                 }
             }
-            RebuildKnownClientDnsSuffixes();
-            foreach (AllowList allowList in _allowListsByUrl.Values) {
+                        foreach (AllowList allowList in _allowListsByUrl.Values) {
                 try {
                     bool changed = await allowList.DownloadAndParseAsync().ConfigureAwait(false);
                     if (!changed)
@@ -238,8 +237,7 @@ namespace AdvancedBlockingWithUrlList {
                 try {
                     bool changed = await ipList.DownloadAndParseAsync().ConfigureAwait(false);
                     if (changed) {
-                        RebuildKnownClientDnsSuffixes();
-                        await ipList.ResolveHostnamesAsync().ConfigureAwait(false);
+                                                await ipList.ResolveHostnamesAsync().ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex) {
@@ -385,30 +383,41 @@ namespace AdvancedBlockingWithUrlList {
                 EDnsHeaderFlags.None,
                 null);
         }
-        private void RebuildKnownClientDnsSuffixes() {
-            _knownClientDnsSuffixes.Clear();
-            foreach (IpList ipList in _ipListsByName.Values) {
-                foreach (string suffix in ipList.GetKnownDnsSuffixes()) {
-                    if (suffix.Length > 0)
-                        _knownClientDnsSuffixes.Add(suffix);
-                }
+        private void LoadQueryNameSuffixesToStrip(JsonElement root) {
+            _queryNameSuffixesToStrip.Clear();
+            if (!root.TryGetProperty("queryNameSuffixesToStrip", out JsonElement suffixes) || suffixes.ValueKind != JsonValueKind.Array)
+                return;
+            HashSet<string> unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (JsonElement item in suffixes.EnumerateArray()) {
+                string normalized = NormalizeDomain(item.GetString() ?? string.Empty);
+                if (normalized.Length == 0)
+                    continue;
+                unique.Add(normalized);
             }
+            List<string> ordered = new List<string>(unique);
+            ordered.Sort((a, b) => b.Length.CompareTo(a.Length));
+            _queryNameSuffixesToStrip.AddRange(ordered);
         }
         private string NormalizeQueryDomain(string domain) {
             string normalized = NormalizeDomain(domain);
-            if (normalized.Length == 0 || _knownClientDnsSuffixes.Count == 0)
+            if (normalized.Length == 0 || _queryNameSuffixesToStrip.Count == 0)
                 return normalized;
-            string? best = null;
-            foreach (string suffix in _knownClientDnsSuffixes) {
-                if (!normalized.EndsWith("." + suffix, StringComparison.OrdinalIgnoreCase))
-                    continue;
-                string candidate = normalized.Substring(0, normalized.Length - suffix.Length - 1);
-                if (candidate.IndexOf('.') < 0)
-                    continue;
-                if (best is null || candidate.Length < best.Length)
-                    best = candidate;
+            while (true) {
+                string? stripped = null;
+                foreach (string suffix in _queryNameSuffixesToStrip) {
+                    if (!normalized.EndsWith("." + suffix, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    string candidate = normalized.Substring(0, normalized.Length - suffix.Length - 1);
+                    if (candidate.Length == 0)
+                        continue;
+                    stripped = candidate;
+                    break;
+                }
+                if (stripped is null)
+                    break;
+                normalized = stripped;
             }
-            return best ?? normalized;
+            return normalized;
         }
         private static IPAddress[]? ParseDnsServers(JsonElement element, string propertyName) {
             if (!element.TryGetProperty(propertyName, out JsonElement servers) || servers.ValueKind != JsonValueKind.Array)
@@ -647,16 +656,6 @@ namespace AdvancedBlockingWithUrlList {
                     _directIps = directIps;
                     _hostnames = hostnames;
                     _resolvedIps = new HashSet<IPAddress>();
-                }
-            }
-            public IEnumerable<string> GetKnownDnsSuffixes() {
-                lock (_syncRoot) {
-                    foreach (string host in _hostnames) {
-                        int index = host.IndexOf('.');
-                        if (index <= 0 || index == host.Length - 1)
-                            continue;
-                        yield return host.Substring(index + 1);
-                    }
                 }
             }
             public async Task ResolveHostnamesAsync() {
