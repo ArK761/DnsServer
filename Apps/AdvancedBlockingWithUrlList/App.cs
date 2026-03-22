@@ -42,6 +42,7 @@ namespace AdvancedBlockingWithUrlList {
         private readonly Dictionary<string, AllowList> _allowListsByUrl = new Dictionary<string, AllowList>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, RegexAllowList> _regexAllowListsByUrl = new Dictionary<string, RegexAllowList>(StringComparer.OrdinalIgnoreCase);
         private readonly List<Group> _groups = new List<Group>();
+        private readonly HashSet<string> _knownClientDnsSuffixes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private CancellationTokenSource? _cts;
         private Task? _downloadLoopTask;
         private Task? _resolveLoopTask;
@@ -69,6 +70,7 @@ namespace AdvancedBlockingWithUrlList {
             LoadIpLists(root);
             LoadGroups(root);
             LinkSharedAllowLists();
+            RebuildKnownClientDnsSuffixes();
             await InitialLoadAsync().ConfigureAwait(false);
             _cts = new CancellationTokenSource();
             _downloadLoopTask = Task.Run(() => DownloadLoopAsync(_cts.Token));
@@ -90,6 +92,7 @@ namespace AdvancedBlockingWithUrlList {
             _allowListsByUrl.Clear();
             _regexAllowListsByUrl.Clear();
             _groups.Clear();
+            _knownClientDnsSuffixes.Clear();
         }
         private void StopWorkers() {
             try {
@@ -170,6 +173,7 @@ namespace AdvancedBlockingWithUrlList {
                     Log("Initial IP list load failed for '" + ipList.LogicalName + "': " + ex.Message);
                 }
             }
+            RebuildKnownClientDnsSuffixes();
             foreach (AllowList allowList in _allowListsByUrl.Values) {
                 try {
                     bool changed = await allowList.DownloadAndParseAsync().ConfigureAwait(false);
@@ -233,8 +237,10 @@ namespace AdvancedBlockingWithUrlList {
                     await Task.Delay(TimeSpan.FromSeconds(_downloadSleepSeconds), cancellationToken).ConfigureAwait(false);
                 try {
                     bool changed = await ipList.DownloadAndParseAsync().ConfigureAwait(false);
-                    if (changed)
+                    if (changed) {
+                        RebuildKnownClientDnsSuffixes();
                         await ipList.ResolveHostnamesAsync().ConfigureAwait(false);
+                    }
                 }
                 catch (Exception ex) {
                     Log("IP list download failed for '" + ipList.LogicalName + "': " + ex.Message);
@@ -272,7 +278,8 @@ namespace AdvancedBlockingWithUrlList {
             if (request is null || request.Question is null || request.Question.Count == 0)
                 return EvaluationResult.None;
             IPAddress clientIp = NormalizeAddress(remoteEP.Address);
-            string domain = NormalizeDomain(request.Question[0].Name);
+            string rawDomain = NormalizeDomain(request.Question[0].Name);
+            string domain = NormalizeQueryDomain(rawDomain);
             List<string> matchedGroupNames = new List<string>();
             foreach (Group group in _groups) {
                 try {
@@ -280,7 +287,7 @@ namespace AdvancedBlockingWithUrlList {
                         continue;
                     matchedGroupNames.Add(group.Name);
                     if (group.IsAllowed(domain, out string? allowSource)) {
-                        Log("ALLOW group='" + group.Name + "' client='" + clientIp + "' domain='" + domain + "' source='" + allowSource + "'");
+                        Log("ALLOW group='" + group.Name + "' client='" + clientIp + "' domain='" + domain + "' rawDomain='" + rawDomain + "' source='" + allowSource + "'");
                         return EvaluationResult.Allow;
                     }
                 }
@@ -291,8 +298,8 @@ namespace AdvancedBlockingWithUrlList {
             if (matchedGroupNames.Count == 0)
                 return EvaluationResult.None;
             blockingGroup = FindFirstMatchedGroup(clientIp);
-            blockingReport = "source=advanced-blocking-with-url-list; action=default-block; client=" + clientIp + "; domain=" + domain + "; groups=" + string.Join(",", matchedGroupNames);
-            Log("BLOCK client='" + clientIp + "' domain='" + domain + "' groups='" + string.Join(",", matchedGroupNames) + "'");
+            blockingReport = "source=advanced-blocking-with-url-list; action=default-block; client=" + clientIp + "; domain=" + domain + "; rawDomain=" + rawDomain + "; groups=" + string.Join(",", matchedGroupNames);
+            Log("BLOCK client='" + clientIp + "' domain='" + domain + "' rawDomain='" + rawDomain + "' groups='" + string.Join(",", matchedGroupNames) + "'");
             return EvaluationResult.Block;
         }
         private Group? FindFirstMatchedGroup(IPAddress clientIp) {
@@ -304,10 +311,11 @@ namespace AdvancedBlockingWithUrlList {
         }
         private DnsDatagram CreateBlockedResponse(DnsDatagram request, Group? group, string? blockingReport) {
             DnsQuestionRecord question = request.Question[0];
+            string ownerName = NormalizeQueryDomain(question.Name);
             if (_defaultBlock.AllowTxtBlockingReport && question.Type == DnsResourceRecordType.TXT) {
                 string txt = blockingReport ?? "source=advanced-blocking-with-url-list; action=default-block";
                 DnsResourceRecord[] txtAnswer = new DnsResourceRecord[] {
-                    new DnsResourceRecord(question.Name, DnsResourceRecordType.TXT, question.Class, _blockingAnswerTtl, new DnsTXTRecordData(txt))
+                    new DnsResourceRecord(ownerName, DnsResourceRecordType.TXT, question.Class, _blockingAnswerTtl, new DnsTXTRecordData(txt))
                 };
                 return new DnsDatagram(request.Identifier, true, DnsOpcode.StandardQuery, false, false, request.RecursionDesired, false, false, false, DnsResponseCode.NoError, request.Question, txtAnswer);
             }
@@ -342,12 +350,12 @@ namespace AdvancedBlockingWithUrlList {
                     if (_defaultBlock.ARecords.Count > 0) {
                         List<DnsResourceRecord> records = new List<DnsResourceRecord>(_defaultBlock.ARecords.Count);
                         foreach (DnsARecordData record in _defaultBlock.ARecords)
-                            records.Add(new DnsResourceRecord(question.Name, DnsResourceRecordType.A, question.Class, _blockingAnswerTtl, record));
+                            records.Add(new DnsResourceRecord(ownerName, DnsResourceRecordType.A, question.Class, _blockingAnswerTtl, record));
                         answer = records;
                     }
                     else {
                         authorityNoError = new DnsResourceRecord[] {
-                            new DnsResourceRecord(question.Name, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
+                            new DnsResourceRecord(ownerName, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
                         };
                     }
                     break;
@@ -356,29 +364,29 @@ namespace AdvancedBlockingWithUrlList {
                     if (_defaultBlock.AAAARecords.Count > 0) {
                         List<DnsResourceRecord> records = new List<DnsResourceRecord>(_defaultBlock.AAAARecords.Count);
                         foreach (DnsAAAARecordData record in _defaultBlock.AAAARecords)
-                            records.Add(new DnsResourceRecord(question.Name, DnsResourceRecordType.AAAA, question.Class, _blockingAnswerTtl, record));
+                            records.Add(new DnsResourceRecord(ownerName, DnsResourceRecordType.AAAA, question.Class, _blockingAnswerTtl, record));
                         answer = records;
                     }
                     else {
                         authorityNoError = new DnsResourceRecord[] {
-                            new DnsResourceRecord(question.Name, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
+                            new DnsResourceRecord(ownerName, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
                         };
                     }
                     break;
                 }
                 case DnsResourceRecordType.NS:
                     answer = new DnsResourceRecord[] {
-                        new DnsResourceRecord(question.Name, DnsResourceRecordType.NS, question.Class, _blockingAnswerTtl, _defaultBlock.NsRecord)
+                        new DnsResourceRecord(ownerName, DnsResourceRecordType.NS, question.Class, _blockingAnswerTtl, _defaultBlock.NsRecord)
                     };
                     break;
                 case DnsResourceRecordType.SOA:
                     answer = new DnsResourceRecord[] {
-                        new DnsResourceRecord(question.Name, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
+                        new DnsResourceRecord(ownerName, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
                     };
                     break;
                 default:
                     authorityNoError = new DnsResourceRecord[] {
-                        new DnsResourceRecord(question.Name, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
+                        new DnsResourceRecord(ownerName, DnsResourceRecordType.SOA, question.Class, _blockingAnswerTtl, _defaultBlock.SoaRecord)
                     };
                     break;
             }
@@ -400,6 +408,31 @@ namespace AdvancedBlockingWithUrlList {
                 request.EDNS is null ? ushort.MinValue : _dnsServer!.UdpPayloadSize,
                 EDnsHeaderFlags.None,
                 null);
+        }
+        private void RebuildKnownClientDnsSuffixes() {
+            _knownClientDnsSuffixes.Clear();
+            foreach (IpList ipList in _ipListsByName.Values) {
+                foreach (string suffix in ipList.GetKnownDnsSuffixes()) {
+                    if (suffix.Length > 0)
+                        _knownClientDnsSuffixes.Add(suffix);
+                }
+            }
+        }
+        private string NormalizeQueryDomain(string domain) {
+            string normalized = NormalizeDomain(domain);
+            if (normalized.Length == 0 || _knownClientDnsSuffixes.Count == 0)
+                return normalized;
+            string? best = null;
+            foreach (string suffix in _knownClientDnsSuffixes) {
+                if (!normalized.EndsWith("." + suffix, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                string candidate = normalized.Substring(0, normalized.Length - suffix.Length - 1);
+                if (candidate.IndexOf('.') < 0)
+                    continue;
+                if (best is null || candidate.Length < best.Length)
+                    best = candidate;
+            }
+            return best ?? normalized;
         }
         private static IPAddress[]? ParseDnsServers(JsonElement element, string propertyName) {
             if (!element.TryGetProperty(propertyName, out JsonElement servers) || servers.ValueKind != JsonValueKind.Array)
@@ -638,6 +671,16 @@ namespace AdvancedBlockingWithUrlList {
                     _directIps = directIps;
                     _hostnames = hostnames;
                     _resolvedIps = new HashSet<IPAddress>();
+                }
+            }
+            public IEnumerable<string> GetKnownDnsSuffixes() {
+                lock (_syncRoot) {
+                    foreach (string host in _hostnames) {
+                        int index = host.IndexOf('.');
+                        if (index <= 0 || index == host.Length - 1)
+                            continue;
+                        yield return host.Substring(index + 1);
+                    }
                 }
             }
             public async Task ResolveHostnamesAsync() {
