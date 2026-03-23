@@ -810,11 +810,11 @@ namespace AdvancedBlockingWithUrlList {
                         _dnsServer.WriteLog("AdvancedBlockingWithUrlList: CIDR list '" + LogicalName + "' ignored single IP without mask: " + value);
                         continue;
                     }
-                    if (!TryParseIpv4Cidr(value, out CidrNetwork? network, out string? reason)) {
+                    if (!TryParseIpv4Cidr(value, out CidrNetwork network, out string? reason)) {
                         _dnsServer.WriteLog("AdvancedBlockingWithUrlList: CIDR list '" + LogicalName + "' ignored entry '" + value + "': " + reason);
                         continue;
                     }
-                    networks.Add(network!);
+                    networks.Add(network);
                 }
                 lock (_syncRoot) {
                     _networks.Clear();
@@ -1008,8 +1008,8 @@ namespace AdvancedBlockingWithUrlList {
             string sanitized = sb.ToString().Trim();
             return sanitized.Length == 0 ? "List" : sanitized;
         }
-        private static bool TryParseIpv4Cidr(string value, out CidrNetwork? network, out string? reason) {
-            network = null;
+        private static bool TryParseIpv4Cidr(string value, out CidrNetwork network, out string? reason) {
+            network = default;
             reason = null;
             string[] parts = value.Split('/');
             if (parts.Length != 2) {
