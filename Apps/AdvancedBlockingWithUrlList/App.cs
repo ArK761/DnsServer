@@ -39,6 +39,7 @@ namespace AdvancedBlockingWithUrlList {
         private IPAddress[]? _resolveDnsServers;
         private DefaultBlockSettings _defaultBlock = DefaultBlockSettings.CreateDefault();
         private readonly Dictionary<string, IpList> _ipListsByName = new Dictionary<string, IpList>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CidrList> _cidrListsByName = new Dictionary<string, CidrList>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, AllowList> _allowListsByUrl = new Dictionary<string, AllowList>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, RegexAllowList> _regexAllowListsByUrl = new Dictionary<string, RegexAllowList>(StringComparer.OrdinalIgnoreCase);
         private readonly List<Group> _groups = new List<Group>();
@@ -69,13 +70,14 @@ namespace AdvancedBlockingWithUrlList {
             LoadQueryNameSuffixesToStrip(root);
             _defaultBlock = DefaultBlockSettings.FromJson(root.TryGetProperty("defaultBlock", out JsonElement defaultBlock) ? defaultBlock : default, dnsServer);
             LoadIpLists(root);
+            LoadCidrLists(root);
             LoadGroups(root);
             LinkSharedAllowLists();
-                        await InitialLoadAsync().ConfigureAwait(false);
+            await InitialLoadAsync().ConfigureAwait(false);
             _cts = new CancellationTokenSource();
             _downloadLoopTask = Task.Run(() => DownloadLoopAsync(_cts.Token));
             _resolveLoopTask = Task.Run(() => ResolveLoopAsync(_cts.Token));
-            Log("Initialized. groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count + ", queryNameSuffixesToStrip=" + (_queryNameSuffixesToStrip.Count == 0 ? "<none>" : string.Join(",", _queryNameSuffixesToStrip)));
+            Log("Initialized. groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", cidrLists=" + _cidrListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count + ", queryNameSuffixesToStrip=" + (_queryNameSuffixesToStrip.Count == 0 ? "<none>" : string.Join(",", _queryNameSuffixesToStrip)));
         }
         public Task<bool> IsAllowedAsync(DnsDatagram request, IPEndPoint remoteEP) {
             EvaluationResult result = EvaluateRequest(request, remoteEP, out _, out _);
@@ -89,6 +91,7 @@ namespace AdvancedBlockingWithUrlList {
         }
         private void ResetState() {
             _ipListsByName.Clear();
+            _cidrListsByName.Clear();
             _allowListsByUrl.Clear();
             _regexAllowListsByUrl.Clear();
             _groups.Clear();
@@ -130,15 +133,41 @@ namespace AdvancedBlockingWithUrlList {
                 _ipListsByName.Add(logicalName, new IpList(_dnsServer!, uri, logicalName, _httpTimeoutSeconds, _resolveDnsServers));
             }
         }
+        private void LoadCidrLists(JsonElement root) {
+            if (!root.TryGetProperty("ipListCIDR", out JsonElement maps) || maps.ValueKind != JsonValueKind.Object)
+                return;
+            foreach (JsonProperty property in maps.EnumerateObject()) {
+                string urlText = property.Name.Trim();
+                string logicalName = (property.Value.GetString() ?? string.Empty).Trim();
+                if (urlText.Length == 0 || logicalName.Length == 0)
+                    continue;
+                if (!Uri.TryCreate(urlText, UriKind.Absolute, out Uri? uri)) {
+                    Log("Skipping invalid ipListCIDR URL: " + urlText);
+                    continue;
+                }
+                if (_cidrListsByName.ContainsKey(logicalName)) {
+                    Log("Duplicate logical CIDR list name ignored: " + logicalName);
+                    continue;
+                }
+                _cidrListsByName.Add(logicalName, new CidrList(_dnsServer!, uri, logicalName, _httpTimeoutSeconds));
+            }
+        }
         private void LoadGroups(JsonElement root) {
             if (!root.TryGetProperty("groups", out JsonElement groups) || groups.ValueKind != JsonValueKind.Array)
                 return;
             foreach (JsonElement item in groups.EnumerateArray()) {
                 Group group = new Group(item);
-                if (_ipListsByName.TryGetValue(group.Name, out IpList? ipList))
+                bool linked = false;
+                if (_ipListsByName.TryGetValue(group.Name, out IpList? ipList)) {
                     group.AttachIpList(ipList);
-                else
-                    Log("Group '" + group.Name + "' has no auto-linked IP list with the same name.");
+                    linked = true;
+                }
+                if (_cidrListsByName.TryGetValue(group.Name, out CidrList? cidrList)) {
+                    group.AttachCidrList(cidrList);
+                    linked = true;
+                }
+                if (!linked)
+                    Log("Group '" + group.Name + "' has no auto-linked IP/CIDR list with the same name.");
                 _groups.Add(group);
             }
         }
@@ -173,7 +202,17 @@ namespace AdvancedBlockingWithUrlList {
                     Log("Initial IP list load failed for '" + ipList.LogicalName + "': " + ex.Message);
                 }
             }
-                        foreach (AllowList allowList in _allowListsByUrl.Values) {
+            foreach (CidrList cidrList in _cidrListsByName.Values) {
+                try {
+                    bool changed = await cidrList.DownloadAndParseAsync().ConfigureAwait(false);
+                    if (!changed)
+                        cidrList.ParseCachedIfNeeded();
+                }
+                catch (Exception ex) {
+                    Log("Initial CIDR list load failed for '" + cidrList.LogicalName + "': " + ex.Message);
+                }
+            }
+            foreach (AllowList allowList in _allowListsByUrl.Values) {
                 try {
                     bool changed = await allowList.DownloadAndParseAsync().ConfigureAwait(false);
                     if (!changed)
@@ -236,12 +275,23 @@ namespace AdvancedBlockingWithUrlList {
                     await Task.Delay(TimeSpan.FromSeconds(_downloadSleepSeconds), cancellationToken).ConfigureAwait(false);
                 try {
                     bool changed = await ipList.DownloadAndParseAsync().ConfigureAwait(false);
-                    if (changed) {
-                                                await ipList.ResolveHostnamesAsync().ConfigureAwait(false);
-                    }
+                    if (changed)
+                        await ipList.ResolveHostnamesAsync().ConfigureAwait(false);
                 }
                 catch (Exception ex) {
                     Log("IP list download failed for '" + ipList.LogicalName + "': " + ex.Message);
+                }
+                index++;
+            }
+            foreach (CidrList cidrList in _cidrListsByName.Values) {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (index > 0 && _downloadSleepSeconds > 0)
+                    await Task.Delay(TimeSpan.FromSeconds(_downloadSleepSeconds), cancellationToken).ConfigureAwait(false);
+                try {
+                    await cidrList.DownloadAndParseAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex) {
+                    Log("CIDR list download failed for '" + cidrList.LogicalName + "': " + ex.Message);
                 }
                 index++;
             }
@@ -476,6 +526,7 @@ namespace AdvancedBlockingWithUrlList {
             private readonly List<AllowList> _allowLists = new List<AllowList>();
             private readonly List<RegexAllowList> _regexAllowLists = new List<RegexAllowList>();
             private IpList? _ipList;
+            private CidrList? _cidrList;
             public string Name { get; }
             public IReadOnlyList<Uri> AllowListUrls { get; }
             public IReadOnlyList<Uri> RegexAllowListUrls { get; }
@@ -504,6 +555,9 @@ namespace AdvancedBlockingWithUrlList {
             public void AttachIpList(IpList ipList) {
                 _ipList = ipList;
             }
+            public void AttachCidrList(CidrList cidrList) {
+                _cidrList = cidrList;
+            }
             public void AttachAllowList(AllowList allowList) {
                 _allowLists.Add(allowList);
             }
@@ -511,7 +565,7 @@ namespace AdvancedBlockingWithUrlList {
                 _regexAllowLists.Add(regexAllowList);
             }
             public bool IsClientMatch(IPAddress clientIp) {
-                return _ipList is not null && _ipList.Contains(clientIp);
+                return (_ipList is not null && _ipList.Contains(clientIp)) || (_cidrList is not null && _cidrList.Contains(clientIp));
             }
             public bool IsAllowed(string domain, out string? source) {
                 string normalized = NormalizeDomain(domain);
@@ -558,11 +612,13 @@ namespace AdvancedBlockingWithUrlList {
             protected readonly IDnsServer _dnsServer;
             private readonly string _cachePath;
             private readonly int _httpTimeoutSeconds;
-            protected DownloadableListBase(IDnsServer dnsServer, Uri listUrl, string cacheFileName, int httpTimeoutSeconds) {
+            protected DownloadableListBase(IDnsServer dnsServer, Uri listUrl, string cacheFileName, int httpTimeoutSeconds, string? subFolder = null) {
                 _dnsServer = dnsServer;
                 ListUrl = listUrl;
                 _httpTimeoutSeconds = httpTimeoutSeconds;
                 string folder = Path.Combine(_dnsServer.ApplicationFolder, "lists");
+                if (!string.IsNullOrWhiteSpace(subFolder))
+                    folder = Path.Combine(folder, subFolder);
                 Directory.CreateDirectory(folder);
                 _cachePath = Path.Combine(folder, cacheFileName);
             }
@@ -729,11 +785,73 @@ namespace AdvancedBlockingWithUrlList {
                 }
             }
         }
+        private sealed class CidrList : DownloadableListBase {
+            private readonly object _syncRoot = new object();
+            private readonly List<CidrNetwork> _networks = new List<CidrNetwork>();
+            public CidrList(IDnsServer dnsServer, Uri listUrl, string logicalName, int httpTimeoutSeconds)
+                : base(dnsServer, listUrl, logicalName, httpTimeoutSeconds) {
+                LogicalName = logicalName;
+            }
+            public string LogicalName { get; }
+            public void ParseCachedIfNeeded() {
+                lock (_syncRoot) {
+                    if (_networks.Count > 0)
+                        return;
+                }
+                ParseCore();
+            }
+            protected override void ParseCore() {
+                List<CidrNetwork> networks = new List<CidrNetwork>();
+                foreach (string line in ReadLines(CachePath)) {
+                    string value = line.Trim();
+                    if (value.Length == 0)
+                        continue;
+                    if (IPAddress.TryParse(value, out _)) {
+                        _dnsServer.WriteLog("AdvancedBlockingWithUrlList: CIDR list '" + LogicalName + "' ignored single IP without mask: " + value);
+                        continue;
+                    }
+                    if (!TryParseIpv4Cidr(value, out CidrNetwork? network, out string? reason)) {
+                        _dnsServer.WriteLog("AdvancedBlockingWithUrlList: CIDR list '" + LogicalName + "' ignored entry '" + value + "': " + reason);
+                        continue;
+                    }
+                    networks.Add(network!);
+                }
+                lock (_syncRoot) {
+                    _networks.Clear();
+                    _networks.AddRange(networks);
+                }
+            }
+            public bool Contains(IPAddress clientIp) {
+                IPAddress normalized = NormalizeAddress(clientIp);
+                if (normalized.AddressFamily != AddressFamily.InterNetwork)
+                    return false;
+                lock (_syncRoot) {
+                    foreach (CidrNetwork network in _networks) {
+                        if (network.Contains(normalized))
+                            return true;
+                    }
+                }
+                return false;
+            }
+        }
+        private readonly struct CidrNetwork {
+            private readonly uint _network;
+            private readonly uint _mask;
+            public CidrNetwork(uint network, int prefixLength) {
+                PrefixLength = prefixLength;
+                _mask = prefixLength == 0 ? 0u : uint.MaxValue << (32 - prefixLength);
+                _network = network & _mask;
+            }
+            public int PrefixLength { get; }
+            public bool Contains(IPAddress address) {
+                return (ToUInt32(address) & _mask) == _network;
+            }
+        }
         private sealed class AllowList : DownloadableListBase {
             private readonly HashSet<string> _patterns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             private readonly object _syncRoot = new object();
             public AllowList(IDnsServer dnsServer, Uri listUrl, int httpTimeoutSeconds)
-                : base(dnsServer, listUrl, MakeUrlCacheName(listUrl, ".allow"), httpTimeoutSeconds) {
+                : base(dnsServer, listUrl, MakeUrlSegmentCacheName(listUrl), httpTimeoutSeconds, "AllowedUrlList") {
             }
             public void ParseCachedIfNeeded() {
                 lock (_syncRoot) {
@@ -772,7 +890,7 @@ namespace AdvancedBlockingWithUrlList {
             private Regex[] _regex = Array.Empty<Regex>();
             private readonly object _syncRoot = new object();
             public RegexAllowList(IDnsServer dnsServer, Uri listUrl, int httpTimeoutSeconds)
-                : base(dnsServer, listUrl, MakeUrlCacheName(listUrl, ".regex"), httpTimeoutSeconds) {
+                : base(dnsServer, listUrl, MakeUrlSegmentCacheName(listUrl), httpTimeoutSeconds, "RegexAllowedUrlList") {
             }
             public void ParseCachedIfNeeded() {
                 lock (_syncRoot) {
@@ -871,14 +989,53 @@ namespace AdvancedBlockingWithUrlList {
                 return domain.Equals(pattern, StringComparison.OrdinalIgnoreCase);
             }
         }
-        private static string MakeUrlCacheName(Uri uri, string suffix) {
-            unchecked {
-                string key = uri.AbsoluteUri.ToLowerInvariant();
-                int hash = 17;
-                foreach (char ch in key)
-                    hash = hash * 31 + ch;
-                return Math.Abs(hash).ToString() + suffix;
+        private static string MakeUrlSegmentCacheName(Uri uri) {
+            string[] segments = uri.AbsolutePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            string candidate = segments.Length == 0 ? uri.Host : segments[segments.Length - 1];
+            return SanitizeFileName(candidate);
+        }
+        private static string SanitizeFileName(string value) {
+            if (string.IsNullOrWhiteSpace(value))
+                return "List";
+            char[] invalid = Path.GetInvalidFileNameChars();
+            StringBuilder sb = new StringBuilder(value.Length);
+            foreach (char c in value.Trim()) {
+                if (Array.IndexOf(invalid, c) >= 0 || c == '/' || c == '\\')
+                    sb.Append('_');
+                else
+                    sb.Append(c);
             }
+            string sanitized = sb.ToString().Trim();
+            return sanitized.Length == 0 ? "List" : sanitized;
+        }
+        private static bool TryParseIpv4Cidr(string value, out CidrNetwork? network, out string? reason) {
+            network = null;
+            reason = null;
+            string[] parts = value.Split('/');
+            if (parts.Length != 2) {
+                reason = "not CIDR";
+                return false;
+            }
+            if (!IPAddress.TryParse(parts[0].Trim(), out IPAddress? ip) || ip.AddressFamily != AddressFamily.InterNetwork) {
+                reason = "only IPv4 CIDR is allowed";
+                return false;
+            }
+            if (!int.TryParse(parts[1].Trim(), out int prefixLength)) {
+                reason = "invalid prefix length";
+                return false;
+            }
+            if (prefixLength < 16 || prefixLength > 29) {
+                reason = "allowed prefix length is /16 to /29";
+                return false;
+            }
+            network = new CidrNetwork(ToUInt32(ip), prefixLength);
+            return true;
+        }
+        private static uint ToUInt32(IPAddress address) {
+            byte[] bytes = NormalizeAddress(address).GetAddressBytes();
+            if (bytes.Length != 4)
+                throw new ArgumentException("IPv4 address required.", nameof(address));
+            return ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3];
         }
     }
     internal static class JsonElementExtensions {
