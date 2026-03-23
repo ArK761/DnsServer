@@ -80,8 +80,7 @@ namespace AdvancedBlockingWithUrlList {
             Log("Initialized. groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", cidrLists=" + _cidrListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count + ", queryNameSuffixesToStrip=" + (_queryNameSuffixesToStrip.Count == 0 ? "<none>" : string.Join(",", _queryNameSuffixesToStrip)));
         }
         public Task<bool> IsAllowedAsync(DnsDatagram request, IPEndPoint remoteEP) {
-            EvaluationResult result = EvaluateRequest(request, remoteEP, out _, out _);
-            return Task.FromResult(result == EvaluationResult.Allow);
+            return Task.FromResult(ShouldBypassBuiltInBlocking(request, remoteEP));
         }
         public Task<DnsDatagram?> ProcessRequestAsync(DnsDatagram request, IPEndPoint remoteEP) {
             EvaluationResult result = EvaluateRequest(request, remoteEP, out Group? group, out string? report);
@@ -320,6 +319,28 @@ namespace AdvancedBlockingWithUrlList {
                 index++;
             }
         }
+        private bool ShouldBypassBuiltInBlocking(DnsDatagram request, IPEndPoint remoteEP) {
+            if (request is null || request.Question is null || request.Question.Count == 0)
+                return false;
+            IPAddress clientIp = NormalizeAddress(remoteEP.Address);
+            string domain = NormalizeDomain(request.Question[0].Name);
+            foreach (Group group in _groups) {
+                try {
+                    if (!group.IsClientMatch(clientIp))
+                        continue;
+                    if (!group.IsAllowed(domain, out _))
+                        continue;
+                    if (group.RespectBuiltInBlocking)
+                        return false;
+                    Log("ALLOW-BYPASS group='" + group.Name + "' client='" + clientIp + "' domain='" + domain + "'");
+                    return true;
+                }
+                catch (Exception ex) {
+                    Log("Built-in bypass evaluation failed in group '" + group.Name + "': " + ex.Message);
+                }
+            }
+            return false;
+        }
         private EvaluationResult EvaluateRequest(DnsDatagram request, IPEndPoint remoteEP, out Group? blockingGroup, out string? blockingReport) {
             blockingGroup = null;
             blockingReport = null;
@@ -335,7 +356,7 @@ namespace AdvancedBlockingWithUrlList {
                         continue;
                     matchedGroupNames.Add(group.Name);
                     if (group.IsAllowed(domain, out string? allowSource)) {
-                        Log("ALLOW group='" + group.Name + "' client='" + clientIp + "' domain='" + domain + "' rawDomain='" + rawDomain + "' source='" + allowSource + "'");
+                        Log("ALLOW group='" + group.Name + "' client='" + clientIp + "' domain='" + domain + "' rawDomain='" + rawDomain + "' source='" + allowSource + "' respectBuiltInBlocking='" + group.RespectBuiltInBlocking + "'");
                         return EvaluationResult.Allow;
                     }
                 }
@@ -530,10 +551,12 @@ namespace AdvancedBlockingWithUrlList {
             public string Name { get; }
             public IReadOnlyList<Uri> AllowListUrls { get; }
             public IReadOnlyList<Uri> RegexAllowListUrls { get; }
+            public bool RespectBuiltInBlocking { get; }
             public Group(JsonElement json) {
                 Name = (json.GetProperty("name").GetString() ?? string.Empty).Trim();
                 if (Name.Length == 0)
                     Name = "default";
+                RespectBuiltInBlocking = json.GetPropertyValue("respectBuiltInBlocking", true);
                 if (json.TryGetProperty("allowed", out JsonElement allowed) && allowed.ValueKind == JsonValueKind.Array) {
                     foreach (JsonElement item in allowed.EnumerateArray()) {
                         string normalized = NormalizeDomain(item.GetString() ?? string.Empty);
