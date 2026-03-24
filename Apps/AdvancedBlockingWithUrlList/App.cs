@@ -31,6 +31,7 @@ namespace AdvancedBlockingWithUrlList {
     public sealed class App : IDnsApplication, IDnsRequestBlockingHandler, IDisposable {
         private static readonly HttpClient s_httpClient = new HttpClient();
         private IDnsServer? _dnsServer;
+        private bool _appEnabled = true;
         private uint _blockingAnswerTtl = 30;
         private int _downloadIntervalMinutes = 5;
         private int _downloadSleepSeconds = 30;
@@ -47,7 +48,7 @@ namespace AdvancedBlockingWithUrlList {
         private CancellationTokenSource? _cts;
         private Task? _downloadLoopTask;
         private Task? _resolveLoopTask;
-        public string Description => "AdvancedBlockingWithUrlList: ordered allow rules per group, with global default block for matched clients and optional query suffix stripping.";
+        public string Description => "AdvancedBlockingWithUrlList: ordered allow rules per group, with global default block for matched clients, optional query suffix stripping, and app-level enable/disable.";
         public void Dispose() {
             StopWorkers();
         }
@@ -61,6 +62,7 @@ namespace AdvancedBlockingWithUrlList {
                 CommentHandling = JsonCommentHandling.Skip
             });
             JsonElement root = doc.RootElement;
+            _appEnabled = root.GetPropertyValue("appEnabled", true);
             _blockingAnswerTtl = root.GetPropertyValue("blockingAnswerTtl", 30u);
             _downloadIntervalMinutes = Math.Max(1, root.GetPropertyValue("blockListUrlUpdateIntervalMinutes", 5));
             _downloadSleepSeconds = Math.Max(0, root.GetPropertyValue("blockListUrlUpdateSleepSeconds", 30));
@@ -73,16 +75,24 @@ namespace AdvancedBlockingWithUrlList {
             LoadCidrLists(root);
             LoadGroups(root);
             LinkSharedAllowLists();
+            if (!_appEnabled) {
+                Log("Initialized in disabled mode. groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", cidrLists=" + _cidrListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count);
+                return;
+            }
             await InitialLoadAsync().ConfigureAwait(false);
             _cts = new CancellationTokenSource();
             _downloadLoopTask = Task.Run(() => DownloadLoopAsync(_cts.Token));
             _resolveLoopTask = Task.Run(() => ResolveLoopAsync(_cts.Token));
-            Log("Initialized. groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", cidrLists=" + _cidrListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count + ", queryNameSuffixesToStrip=" + (_queryNameSuffixesToStrip.Count == 0 ? "<none>" : string.Join(",", _queryNameSuffixesToStrip)));
+            Log("Initialized. appEnabled=" + _appEnabled + ", groups=" + _groups.Count + ", ipLists=" + _ipListsByName.Count + ", cidrLists=" + _cidrListsByName.Count + ", allowLists=" + _allowListsByUrl.Count + ", regexAllowLists=" + _regexAllowListsByUrl.Count + ", queryNameSuffixesToStrip=" + (_queryNameSuffixesToStrip.Count == 0 ? "<none>" : string.Join(",", _queryNameSuffixesToStrip)));
         }
         public Task<bool> IsAllowedAsync(DnsDatagram request, IPEndPoint remoteEP) {
+            if (!_appEnabled)
+                return Task.FromResult(false);
             return Task.FromResult(ShouldBypassBuiltInBlocking(request, remoteEP));
         }
         public Task<DnsDatagram?> ProcessRequestAsync(DnsDatagram request, IPEndPoint remoteEP) {
+            if (!_appEnabled)
+                return Task.FromResult<DnsDatagram?>(null);
             EvaluationResult result = EvaluateRequest(request, remoteEP, out Group? group, out string? report);
             if (result != EvaluationResult.Block)
                 return Task.FromResult<DnsDatagram?>(null);
@@ -95,6 +105,7 @@ namespace AdvancedBlockingWithUrlList {
             _regexAllowListsByUrl.Clear();
             _groups.Clear();
             _queryNameSuffixesToStrip.Clear();
+            _appEnabled = true;
         }
         private void StopWorkers() {
             try {
